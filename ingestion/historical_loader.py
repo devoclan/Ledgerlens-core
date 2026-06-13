@@ -12,6 +12,7 @@ import pandas as pd
 
 from config.settings import settings
 from ingestion.horizon_streamer import _parse_trade
+from ingestion.http_client import get_with_retry
 
 PAGE_LIMIT = 200
 
@@ -44,8 +45,7 @@ def load_historical_trades(
 
     with httpx.Client(timeout=30.0) as client:
         while url:
-            response = client.get(url, params=params)
-            response.raise_for_status()
+            response = get_with_retry(client, url, params=params)
             payload = response.json()
             page_records = payload["_embedded"]["records"]
             if not page_records:

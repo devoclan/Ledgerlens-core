@@ -10,6 +10,7 @@ import httpx
 
 from config.settings import settings
 from ingestion.data_models import OrderBookEvent
+from ingestion.http_client import get_with_retry
 
 OFFER_OPERATION_TYPES = ("manage_buy_offer", "manage_sell_offer", "create_passive_sell_offer")
 
@@ -54,8 +55,7 @@ def load_order_book_events(account: str, limit: int = 200) -> list[OrderBookEven
     params = {"order": "desc", "limit": limit}
 
     with httpx.Client(timeout=30.0) as client:
-        response = client.get(url, params=params)
-        response.raise_for_status()
+        response = get_with_retry(client, url, params=params)
         records = response.json()["_embedded"]["records"]
 
     return [_parse_event(r) for r in records if r["type"] in OFFER_OPERATION_TYPES]

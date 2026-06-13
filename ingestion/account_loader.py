@@ -11,6 +11,7 @@ from datetime import datetime
 import httpx
 
 from config.settings import settings
+from ingestion.http_client import get_with_retry
 
 
 def get_account_creation_info(account: str) -> dict:
@@ -24,8 +25,7 @@ def get_account_creation_info(account: str) -> dict:
     params = {"order": "asc", "limit": 1}
 
     with httpx.Client(timeout=30.0) as client:
-        response = client.get(url, params=params)
-        response.raise_for_status()
+        response = get_with_retry(client, url, params=params)
         records = response.json()["_embedded"]["records"]
 
     if not records or records[0]["type"] != "create_account":
