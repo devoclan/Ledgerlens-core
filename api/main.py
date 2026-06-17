@@ -22,7 +22,7 @@ from pydantic import BaseModel
 
 from config.settings import settings
 from detection.risk_score import RiskScore
-from detection.storage import get_latest_scores, get_pair_correlations
+from detection.storage import get_latest_scores, get_pair_correlations, get_rings
 from detection.webhook_queue import get_dead_letters
 from detection.webhook_registry import deactivate_subscriber, list_subscribers, register_subscriber
 
@@ -121,6 +121,12 @@ def list_correlations() -> list[dict]:
     run timestamp.
     """
     return get_pair_correlations()
+
+
+@app.get("/rings")
+def list_rings() -> list[dict]:
+    """Return wash-ring descriptors from the latest pipeline run."""
+    return get_rings()
 
 
 # ---------------------------------------------------------------------------

@@ -6,6 +6,7 @@ integration point is wired up (see README's "Open Integration Points"),
 `RiskScore` records here.
 """
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -50,6 +51,18 @@ CREATE TABLE IF NOT EXISTS pair_correlations (
 );
 CREATE INDEX IF NOT EXISTS idx_pair_correlations_pair_a ON pair_correlations (pair_a);
 CREATE INDEX IF NOT EXISTS idx_pair_correlations_pair_b ON pair_correlations (pair_b);
+
+CREATE TABLE IF NOT EXISTS wash_rings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    accounts_json TEXT NOT NULL,
+    total_volume REAL NOT NULL,
+    cycle_volume REAL NOT NULL,
+    avg_trade_count REAL NOT NULL,
+    timing_tightness REAL NOT NULL,
+    truncated INTEGER NOT NULL,
+    detected_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wash_rings_detected_at ON wash_rings (detected_at);
 """
 
 
@@ -275,6 +288,69 @@ def get_pair_correlations(db_path: str | None = None) -> list[dict]:
             "method": row[3],
             "shared_wallet_count": row[4],
             "timestamp": row[5],
+        }
+        for row in rows
+    ]
+
+
+def save_rings(rings: list[dict], db_path: str | None = None) -> None:
+    """Persist wash-ring descriptors from the latest pipeline run."""
+    init_db(db_path)
+    if not rings:
+        with _connect(db_path) as conn:
+            conn.execute("DELETE FROM wash_rings")
+            conn.commit()
+        return
+
+    detected_at = datetime.now(timezone.utc).isoformat()
+    with _connect(db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO wash_rings
+                (accounts_json, total_volume, cycle_volume, avg_trade_count,
+                 timing_tightness, truncated, detected_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    json.dumps(ring.get("accounts", [])),
+                    float(ring.get("total_volume", 0.0)),
+                    float(ring.get("cycle_volume", 0.0)),
+                    float(ring.get("avg_trade_count", 0.0)),
+                    float(ring.get("timing_tightness", 0.0)),
+                    int(bool(ring.get("truncated", False))),
+                    detected_at,
+                )
+                for ring in rings
+            ],
+        )
+        conn.commit()
+
+
+def get_rings(db_path: str | None = None) -> list[dict]:
+    """Return wash-ring descriptors from the latest pipeline run."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT wr.accounts_json, wr.total_volume, wr.cycle_volume,
+                   wr.avg_trade_count, wr.timing_tightness, wr.truncated, wr.detected_at
+            FROM wash_rings wr
+            JOIN (
+                SELECT MAX(detected_at) AS max_ts FROM wash_rings
+            ) latest ON wr.detected_at = latest.max_ts
+            ORDER BY wr.total_volume DESC
+            """
+        ).fetchall()
+    return [
+        {
+            "accounts": json.loads(row[0]),
+            "total_volume": row[1],
+            "cycle_volume": row[2],
+            "avg_trade_count": row[3],
+            "timing_tightness": row[4],
+            "truncated": bool(row[5]),
+            "detected_at": row[6],
         }
         for row in rows
     ]

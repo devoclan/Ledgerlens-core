@@ -6,7 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from detection.risk_score import RiskScore
-from detection.storage import save_scores
+from detection.storage import save_rings, save_scores
 
 
 @pytest.fixture(autouse=True)
@@ -414,3 +414,42 @@ def test_correlations_returns_only_latest_run(client, monkeypatch):
     pairs = {(r["pair_a"], r["pair_b"]) for r in body}
     assert ("XLM/USDC", "XLM/yXLM") in pairs
     assert ("XLM/USDC", "XLM/AQUA") not in pairs
+
+
+# ---------------------------------------------------------------------------
+# /rings
+# ---------------------------------------------------------------------------
+
+
+def test_rings_empty(client):
+    resp = client.get("/rings")
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_rings_returns_stored_data(client):
+    import detection.storage as storage_module
+
+    storage_module.save_rings(
+        [
+            {
+                "accounts": ["A", "B", "C"],
+                "total_volume": 300.0,
+                "cycle_volume": 100.0,
+                "avg_trade_count": 1.0,
+                "timing_tightness": 0.0,
+                "truncated": False,
+            }
+        ],
+        db_path=storage_module.settings.db_path,
+    )
+
+    resp = client.get("/rings")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 1
+    row = body[0]
+    assert row["accounts"] == ["A", "B", "C"]
+    assert row["total_volume"] == 300.0
+    assert row["cycle_volume"] == 100.0
+    assert row["detected_at"]

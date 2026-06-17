@@ -20,9 +20,10 @@ from detection.cross_pair_engine import (
     find_cross_pair_wallets,
 )
 from detection.feature_engineering import build_feature_vector
+from detection.graph_engine import build_ring_membership_index, build_transaction_graph, find_wash_rings
 from detection.model_inference import load_models, score_feature_matrix, score_feature_vector
 from detection.risk_score import RiskScore
-from detection.storage import save_pair_correlations, save_scores
+from detection.storage import save_pair_correlations, save_rings, save_scores
 from ingestion.account_loader import async_load_account_metadata, load_account_metadata
 from ingestion.historical_loader import async_load_historical_trades, load_historical_trades
 from ingestion.http_client import AsyncHorizonClient
@@ -56,6 +57,7 @@ def run(
     ]
     models = load_models()
     scores: list[RiskScore] = []
+    all_rings: list[dict] = []
 
     # Pre-load all trades when running in multi-pair mode
     trades_by_pair: dict[str, pd.DataFrame] = {}
@@ -97,6 +99,10 @@ def run(
             continue
 
         as_of = pd.Timestamp(trades["ledger_close_time"].max())
+        graph = build_transaction_graph(trades)
+        rings = find_wash_rings(graph)
+        all_rings.extend(rings)
+        ring_membership = build_ring_membership_index(rings, trades=trades)
         accounts = pd.unique(trades[["base_account", "counter_account"]].values.ravel())
         account_metadata = load_account_metadata(list(accounts))
         all_order_book_events = load_order_book_events_for_pair(
@@ -116,6 +122,7 @@ def run(
                 trades_by_pair=trades_by_pair if multi_pair else None,
                 correlated_pairs=correlated_pairs if multi_pair else None,
                 cross_pair_wallets=cross_pair_wallets_map if multi_pair else None,
+                ring_membership=ring_membership,
             )
             probability, confidence = score_feature_vector(models, features)
 
@@ -131,6 +138,7 @@ def run(
 
     logger.info("Computed %d risk scores", len(scores))
     save_scores(scores)
+    save_rings(all_rings)
 
     _enqueue_webhook_alerts(scores)
 
@@ -199,6 +207,7 @@ async def async_run(
     ]
     models = load_models()
     scores: list[RiskScore] = []
+    all_rings: list[dict] = []
 
     async with AsyncHorizonClient(settings.horizon_url, max_concurrency=max_concurrency) as client:
         for base_asset, counter_asset in asset_pairs:
@@ -213,6 +222,10 @@ async def async_run(
                 continue
 
             as_of = pd.Timestamp(trades["ledger_close_time"].max())
+            graph = build_transaction_graph(trades)
+            rings = find_wash_rings(graph)
+            all_rings.extend(rings)
+            ring_membership = build_ring_membership_index(rings, trades=trades)
             accounts = list(pd.unique(trades[["base_account", "counter_account"]].values.ravel()))
 
             since = as_of.to_pydatetime() - timedelta(days=settings.trade_history_lookback_days)
@@ -230,6 +243,7 @@ async def async_run(
                     as_of,
                     order_book_events=order_book_events,
                     account_metadata=account_metadata,
+                    ring_membership=ring_membership,
                 )
                 for account in accounts
             ]
@@ -251,6 +265,7 @@ async def async_run(
 
     logger.info("Computed %d risk scores", len(scores))
     save_scores(scores)
+    save_rings(all_rings)
     _enqueue_webhook_alerts(scores)
     _submit_on_chain(scores)
 

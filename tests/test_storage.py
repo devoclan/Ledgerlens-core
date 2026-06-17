@@ -1,9 +1,10 @@
 from datetime import datetime, timedelta, timezone
+import time
 
 import pytest
 
 from detection.risk_score import RiskScore
-from detection.storage import get_latest_scores, init_db, save_scores
+from detection.storage import get_latest_scores, get_rings, init_db, save_rings, save_scores
 
 
 @pytest.fixture
@@ -180,4 +181,82 @@ def test_get_latest_scores_applies_limit_offset_in_sql(tmp_path, monkeypatch):
 
     assert "LIMIT ? OFFSET ?" in calls["query"]
     assert calls["params"] == (5, 10)
+
+
+def test_save_and_get_rings_round_trip(db_path):
+    rings = [
+        {
+            "accounts": ["A", "B", "C"],
+            "total_volume": 300.0,
+            "cycle_volume": 100.0,
+            "avg_trade_count": 1.0,
+            "timing_tightness": 0.0,
+            "truncated": False,
+        }
+    ]
+
+    save_rings(rings, db_path)
+    stored = get_rings(db_path)
+
+    assert len(stored) == 1
+    row = stored[0]
+    assert row["accounts"] == ["A", "B", "C"]
+    assert row["total_volume"] == 300.0
+    assert row["cycle_volume"] == 100.0
+    assert row["truncated"] is False
+    assert "detected_at" in row
+
+
+def test_get_rings_returns_only_latest_run(db_path):
+    save_rings(
+        [
+            {
+                "accounts": ["A", "B", "C"],
+                "total_volume": 300.0,
+                "cycle_volume": 100.0,
+                "avg_trade_count": 1.0,
+                "timing_tightness": 0.0,
+                "truncated": False,
+            }
+        ],
+        db_path,
+    )
+    time.sleep(0.01)
+    save_rings(
+        [
+            {
+                "accounts": ["D", "E", "F", "G"],
+                "total_volume": 400.0,
+                "cycle_volume": 100.0,
+                "avg_trade_count": 1.0,
+                "timing_tightness": 0.0,
+                "truncated": False,
+            }
+        ],
+        db_path,
+    )
+
+    stored = get_rings(db_path)
+
+    assert [row["accounts"] for row in stored] == [["D", "E", "F", "G"]]
+
+
+def test_save_empty_rings_clears_previous_run(db_path):
+    save_rings(
+        [
+            {
+                "accounts": ["A", "B", "C"],
+                "total_volume": 300.0,
+                "cycle_volume": 100.0,
+                "avg_trade_count": 1.0,
+                "timing_tightness": 0.0,
+                "truncated": False,
+            }
+        ],
+        db_path,
+    )
+
+    save_rings([], db_path)
+
+    assert get_rings(db_path) == []
 
