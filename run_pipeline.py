@@ -149,7 +149,11 @@ def run(
     save_scores(scores)
 
     # Persist feature vectors and compute+cache SHAP values using XGBoost model.
-    if feature_vec_rows:
+    if scored_features:
+        feature_vec_rows = [
+            {"wallet": w, "asset_pair": p, "features": f}
+            for w, p, f in zip(scored_wallets, scored_pairs, scored_features)
+        ]
         save_feature_vectors(feature_vec_rows)
         xgb_model = models.get("xgboost")
         if xgb_model is not None:
