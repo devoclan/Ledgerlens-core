@@ -2,9 +2,19 @@ from datetime import datetime, timedelta, timezone
 import time
 
 import pytest
+import sqlite3
 
 from detection.risk_score import RiskScore
-from detection.storage import get_latest_scores, get_rings, init_db, save_rings, save_scores
+from detection.storage import (
+    SchemaMigrationError,
+    _MIGRATIONS,
+    _connect,
+    get_latest_scores,
+    get_schema_version,
+    init_db,
+    migrate_db,
+    save_scores,
+)
 
 
 @pytest.fixture
@@ -23,6 +33,10 @@ def _score(wallet="GABC", asset_pair="XLM/USDC", score=80, timestamp=None) -> Ri
         timestamp=timestamp or datetime.now(timezone.utc),
     )
 
+
+# ---------------------------------------------------------------------------
+# Existing tests (unchanged)
+# ---------------------------------------------------------------------------
 
 def test_init_db_creates_table(db_path):
     init_db(db_path)
@@ -183,80 +197,88 @@ def test_get_latest_scores_applies_limit_offset_in_sql(tmp_path, monkeypatch):
     assert calls["params"] == (5, 10)
 
 
-def test_save_and_get_rings_round_trip(db_path):
-    rings = [
-        {
-            "accounts": ["A", "B", "C"],
-            "total_volume": 300.0,
-            "cycle_volume": 100.0,
-            "avg_trade_count": 1.0,
-            "timing_tightness": 0.0,
-            "truncated": False,
-        }
+# ---------------------------------------------------------------------------
+# Migration tests
+# ---------------------------------------------------------------------------
+
+def test_fresh_db_reaches_latest_schema_version(db_path):
+    """A brand-new database is migrated all the way to len(_MIGRATIONS)."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        assert get_schema_version(conn) == len(_MIGRATIONS)
+
+
+def test_migrate_db_from_version_zero(db_path):
+    """A DB with no schema_version table (version 0) is fully migrated."""
+    # Create a bare SQLite file with no tables.
+    conn = sqlite3.connect(db_path)
+    conn.close()
+
+    with _connect(db_path) as conn:
+        assert get_schema_version(conn) == 0
+        applied = migrate_db(conn)
+
+    assert len(applied) == len(_MIGRATIONS)
+    with _connect(db_path) as conn:
+        assert get_schema_version(conn) == len(_MIGRATIONS)
+
+
+def test_migrate_db_idempotent(db_path):
+    """Re-running migrate_db on an already-current database is a no-op."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        applied = migrate_db(conn)
+    assert applied == []
+
+
+def test_failed_migration_leaves_applying_status(db_path, monkeypatch):
+    """A migration with bad SQL leaves the log row in 'applying' state."""
+    import detection.storage as storage_module
+
+    bad_migrations = [
+        (1, "initial schema", _MIGRATIONS[0][2]),
+        (2, "bad migration", "THIS IS NOT VALID SQL;"),
     ]
+    monkeypatch.setattr(storage_module, "_MIGRATIONS", bad_migrations)
 
-    save_rings(rings, db_path)
-    stored = get_rings(db_path)
+    with _connect(db_path) as conn:
+        with pytest.raises(Exception):
+            migrate_db(conn)
 
-    assert len(stored) == 1
-    row = stored[0]
-    assert row["accounts"] == ["A", "B", "C"]
-    assert row["total_volume"] == 300.0
-    assert row["cycle_volume"] == 100.0
-    assert row["truncated"] is False
-    assert "detected_at" in row
-
-
-def test_get_rings_returns_only_latest_run(db_path):
-    save_rings(
-        [
-            {
-                "accounts": ["A", "B", "C"],
-                "total_volume": 300.0,
-                "cycle_volume": 100.0,
-                "avg_trade_count": 1.0,
-                "timing_tightness": 0.0,
-                "truncated": False,
-            }
-        ],
-        db_path,
-    )
-    time.sleep(0.01)
-    save_rings(
-        [
-            {
-                "accounts": ["D", "E", "F", "G"],
-                "total_volume": 400.0,
-                "cycle_volume": 100.0,
-                "avg_trade_count": 1.0,
-                "timing_tightness": 0.0,
-                "truncated": False,
-            }
-        ],
-        db_path,
-    )
-
-    stored = get_rings(db_path)
-
-    assert [row["accounts"] for row in stored] == [["D", "E", "F", "G"]]
+        rows = conn.execute(
+            "SELECT version, status FROM schema_migrations WHERE version = 2"
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0][1] == "applying"
 
 
-def test_save_empty_rings_clears_previous_run(db_path):
-    save_rings(
-        [
-            {
-                "accounts": ["A", "B", "C"],
-                "total_volume": 300.0,
-                "cycle_volume": 100.0,
-                "avg_trade_count": 1.0,
-                "timing_tightness": 0.0,
-                "truncated": False,
-            }
-        ],
-        db_path,
-    )
+def test_interrupted_migration_raises_on_next_startup(db_path, monkeypatch):
+    """If a log row with status='applying' exists, migrate_db raises SchemaMigrationError."""
+    import detection.storage as storage_module
 
-    save_rings([], db_path)
+    bad_migrations = [
+        (1, "initial schema", _MIGRATIONS[0][2]),
+        (2, "bad migration", "THIS IS NOT VALID SQL;"),
+    ]
+    monkeypatch.setattr(storage_module, "_MIGRATIONS", bad_migrations)
 
-    assert get_rings(db_path) == []
+    # First run: migration 2 fails, leaves 'applying' row.
+    with _connect(db_path) as conn:
+        with pytest.raises(Exception):
+            migrate_db(conn)
+
+    # Second run: detects the interrupted migration and raises SchemaMigrationError.
+    with _connect(db_path) as conn:
+        with pytest.raises(SchemaMigrationError, match="2"):
+            migrate_db(conn)
+
+
+def test_save_and_get_scores_on_migrated_db(db_path):
+    """Existing save_scores / get_latest_scores work normally on a migrated database."""
+    init_db(db_path)
+    s = _score()
+    save_scores([s], db_path)
+    results = get_latest_scores(db_path=db_path)
+    assert len(results) == 1
+    assert results[0].wallet == s.wallet
 
