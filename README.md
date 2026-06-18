@@ -317,6 +317,17 @@ python cli.py serve           # serve the local API
 python cli.py webhook-worker  # run the webhook delivery worker
 ```
 
+The local API exposes a SHAP explain endpoint once the pipeline has run:
+
+```bash
+GET /scores/{wallet}/explain?asset_pair=XLM%2FUSDC
+```
+
+Returns the top-5 SHAP feature contributions (ordered by absolute value) for
+the given wallet and asset pair, served from the pre-computed cache written by
+`run_pipeline.py`. Returns 404 if no cache entry exists, 503 if models were
+not loaded at startup.
+
 ## Webhook Alerts
 
 LedgerLens can push risk-score alerts to subscriber URLs via webhooks.

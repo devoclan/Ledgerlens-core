@@ -6,6 +6,7 @@ integration point is wired up (see README's "Open Integration Points"),
 `RiskScore` records here.
 """
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -50,6 +51,16 @@ CREATE TABLE IF NOT EXISTS pair_correlations (
 );
 CREATE INDEX IF NOT EXISTS idx_pair_correlations_pair_a ON pair_correlations (pair_a);
 CREATE INDEX IF NOT EXISTS idx_pair_correlations_pair_b ON pair_correlations (pair_b);
+CREATE TABLE IF NOT EXISTS feature_vectors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    wallet TEXT NOT NULL,
+    asset_pair TEXT NOT NULL,
+    features_json TEXT NOT NULL,
+    shap_json TEXT,
+    timestamp TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_feature_vectors_wallet ON feature_vectors (wallet);
+CREATE INDEX IF NOT EXISTS idx_feature_vectors_asset_pair ON feature_vectors (asset_pair);
 """
 
 
@@ -278,6 +289,112 @@ def get_pair_correlations(db_path: str | None = None) -> list[dict]:
         }
         for row in rows
     ]
+
+
+def save_feature_vectors(vectors: list[dict], db_path: str | None = None) -> None:
+    """Persist a list of feature vector dicts to the ``feature_vectors`` table.
+
+    Each dict must contain ``wallet``, ``asset_pair``, and ``features``
+    (the raw feature dict produced by ``build_feature_vector``).
+    """
+    if not vectors:
+        return
+    init_db(db_path)
+    ts = datetime.now(timezone.utc).isoformat()
+    with _connect(db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO feature_vectors (wallet, asset_pair, features_json, timestamp)
+            VALUES (?, ?, ?, ?)
+            """,
+            [
+                (
+                    v["wallet"],
+                    v["asset_pair"],
+                    json.dumps(v["features"]),
+                    ts,
+                )
+                for v in vectors
+            ],
+        )
+        conn.commit()
+
+
+def get_feature_vector(
+    wallet: str,
+    asset_pair: str,
+    db_path: str | None = None,
+) -> dict | None:
+    """Return the most recent feature dict for ``wallet`` / ``asset_pair``, or ``None``."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT features_json FROM feature_vectors
+            WHERE wallet = ? AND asset_pair = ?
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (wallet, asset_pair),
+        ).fetchone()
+    if row is None:
+        return None
+    return json.loads(row[0])
+
+
+def save_shap_values(
+    wallet: str,
+    asset_pair: str,
+    shap_values: list[dict],
+    db_path: str | None = None,
+) -> None:
+    """Persist SHAP values for the most recent ``feature_vectors`` row for the pair.
+
+    ``shap_values`` must be a list of ``{"feature": str, "shap_value": float}``
+    dicts ordered by absolute contribution descending (top-5).
+    """
+    init_db(db_path)
+    shap_json = json.dumps(shap_values)
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE feature_vectors SET shap_json = ?
+            WHERE id = (
+                SELECT id FROM feature_vectors
+                WHERE wallet = ? AND asset_pair = ?
+                ORDER BY timestamp DESC
+                LIMIT 1
+            )
+            """,
+            (shap_json, wallet, asset_pair),
+        )
+        conn.commit()
+
+
+def get_shap_values(
+    wallet: str,
+    asset_pair: str,
+    db_path: str | None = None,
+) -> list[dict] | None:
+    """Return the cached SHAP values for ``wallet`` / ``asset_pair``, or ``None``.
+
+    Returns a list of ``{"feature": str, "shap_value": float}`` dicts ordered
+    by absolute contribution descending, or ``None`` if no cache entry exists.
+    """
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT shap_json FROM feature_vectors
+            WHERE wallet = ? AND asset_pair = ?
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (wallet, asset_pair),
+        ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return json.loads(row[0])
 
 
 if __name__ == "__main__":

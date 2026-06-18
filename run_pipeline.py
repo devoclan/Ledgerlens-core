@@ -22,7 +22,8 @@ from detection.cross_pair_engine import (
 from detection.feature_engineering import build_feature_vector
 from detection.model_inference import load_models, score_feature_matrix, score_feature_vector
 from detection.risk_score import RiskScore
-from detection.storage import save_pair_correlations, save_scores
+from detection.storage import save_feature_vectors, save_pair_correlations, save_scores
+from detection.shap_explainer import explain_score, top_contributing_features
 from ingestion.account_loader import async_load_account_metadata, load_account_metadata
 from ingestion.historical_loader import async_load_historical_trades, load_historical_trades
 from ingestion.http_client import AsyncHorizonClient
@@ -56,6 +57,7 @@ def run(
     ]
     models = load_models()
     scores: list[RiskScore] = []
+    feature_vec_rows: list[dict] = []
 
     # Pre-load all trades when running in multi-pair mode
     trades_by_pair: dict[str, pd.DataFrame] = {}
@@ -128,9 +130,30 @@ def run(
                 ml_confidence=confidence,
             )
             scores.append(score)
+            feature_vec_rows.append({"wallet": account, "asset_pair": pair_key, "features": features})
 
     logger.info("Computed %d risk scores", len(scores))
     save_scores(scores)
+
+    # Persist feature vectors and compute+cache SHAP values using XGBoost model.
+    if feature_vec_rows:
+        save_feature_vectors(feature_vec_rows)
+        xgb_model = models.get("xgboost")
+        if xgb_model is not None:
+            from detection.storage import save_shap_values
+
+            for row in feature_vec_rows:
+                try:
+                    explanation = explain_score(xgb_model, row["features"])
+                    top = top_contributing_features(explanation, n=5)
+                    shap_payload = [{"feature": f, "shap_value": v} for f, v in top]
+                    save_shap_values(row["wallet"], row["asset_pair"], shap_payload)
+                except Exception:
+                    logger.exception(
+                        "Failed to compute SHAP for wallet=%s pair=%s",
+                        row["wallet"],
+                        row["asset_pair"],
+                    )
 
     _enqueue_webhook_alerts(scores)
 

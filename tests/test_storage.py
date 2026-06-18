@@ -3,7 +3,15 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from detection.risk_score import RiskScore
-from detection.storage import get_latest_scores, init_db, save_scores
+from detection.storage import (
+    get_feature_vector,
+    get_latest_scores,
+    get_shap_values,
+    init_db,
+    save_feature_vectors,
+    save_scores,
+    save_shap_values,
+)
 
 
 @pytest.fixture
@@ -181,3 +189,82 @@ def test_get_latest_scores_applies_limit_offset_in_sql(tmp_path, monkeypatch):
     assert "LIMIT ? OFFSET ?" in calls["query"]
     assert calls["params"] == (5, 10)
 
+
+# ---------------------------------------------------------------------------
+# Feature vector + SHAP value round-trip tests
+# ---------------------------------------------------------------------------
+
+_FEATURES = {
+    "benford_mad_24h": 0.02,
+    "round_trip_trade_frequency": 0.1,
+    "network_centrality": 0.5,
+}
+
+
+def test_save_and_get_feature_vector(db_path):
+    save_feature_vectors(
+        [{"wallet": "GABC", "asset_pair": "XLM/USDC", "features": _FEATURES}],
+        db_path,
+    )
+    result = get_feature_vector("GABC", "XLM/USDC", db_path)
+    assert result is not None
+    assert result["benford_mad_24h"] == pytest.approx(0.02)
+    assert result["round_trip_trade_frequency"] == pytest.approx(0.1)
+
+
+def test_get_feature_vector_returns_none_for_unknown_wallet(db_path):
+    init_db(db_path)
+    assert get_feature_vector("GUNKNOWN", "XLM/USDC", db_path) is None
+
+
+def test_get_feature_vector_returns_most_recent(db_path):
+    save_feature_vectors(
+        [{"wallet": "GABC", "asset_pair": "XLM/USDC", "features": {"benford_mad_24h": 0.01}}],
+        db_path,
+    )
+    save_feature_vectors(
+        [{"wallet": "GABC", "asset_pair": "XLM/USDC", "features": {"benford_mad_24h": 0.99}}],
+        db_path,
+    )
+    result = get_feature_vector("GABC", "XLM/USDC", db_path)
+    assert result["benford_mad_24h"] == pytest.approx(0.99)
+
+
+def test_save_and_get_shap_values(db_path):
+    # Must have a feature_vectors row first.
+    save_feature_vectors(
+        [{"wallet": "GABC", "asset_pair": "XLM/USDC", "features": _FEATURES}],
+        db_path,
+    )
+    shap_payload = [
+        {"feature": "benford_mad_24h", "shap_value": 0.35},
+        {"feature": "round_trip_trade_frequency", "shap_value": -0.20},
+        {"feature": "network_centrality", "shap_value": 0.10},
+    ]
+    save_shap_values("GABC", "XLM/USDC", shap_payload, db_path)
+
+    result = get_shap_values("GABC", "XLM/USDC", db_path)
+    assert result is not None
+    assert len(result) == 3
+    assert result[0]["feature"] == "benford_mad_24h"
+    assert result[0]["shap_value"] == pytest.approx(0.35)
+
+
+def test_get_shap_values_returns_none_for_unknown_wallet(db_path):
+    init_db(db_path)
+    assert get_shap_values("GUNKNOWN", "XLM/USDC", db_path) is None
+
+
+def test_get_shap_values_returns_none_when_not_yet_computed(db_path):
+    # Feature vector present but no SHAP values written yet.
+    save_feature_vectors(
+        [{"wallet": "GABC", "asset_pair": "XLM/USDC", "features": _FEATURES}],
+        db_path,
+    )
+    assert get_shap_values("GABC", "XLM/USDC", db_path) is None
+
+
+def test_save_feature_vectors_noop_on_empty_list(db_path):
+    init_db(db_path)
+    save_feature_vectors([], db_path)  # Should not raise.
+    assert get_feature_vector("GABC", "XLM/USDC", db_path) is None
