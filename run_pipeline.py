@@ -23,15 +23,26 @@ from detection.drift_monitor import record_scored_features
 from detection.feature_engineering import build_feature_vector
 from detection.graph_engine import build_ring_membership_index, build_transaction_graph, find_wash_rings
 from detection.model_inference import load_models, score_feature_matrix, score_feature_vector
+from detection.path_payment_engine import detect_atomic_circular_routes
 from detection.risk_score import RiskScore
-from detection.storage import save_pair_correlations, save_rings, save_scores
+from detection.storage import (
+    save_circular_routes,
+    save_feature_vectors,
+    save_liquidity_pool_trades,
+    save_pair_correlations,
+    save_path_payments,
+    save_scores,
+)
+from detection.shap_explainer import explain_score, top_contributing_features
 from ingestion.account_loader import async_load_account_metadata, load_account_metadata
+from ingestion.data_models import TradeType
 from ingestion.historical_loader import async_load_historical_trades, load_historical_trades
 from ingestion.http_client import AsyncHorizonClient
 from ingestion.operations_loader import (
     async_load_order_book_events_for_pair,
     load_order_book_events_for_pair,
 )
+from ingestion.path_payment_loader import async_load_path_payments, load_path_payments_for_accounts
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ledgerlens.pipeline")
@@ -107,13 +118,24 @@ def run(
         all_rings.extend(rings)
         ring_membership = build_ring_membership_index(rings, trades=trades)
         accounts = pd.unique(trades[["base_account", "counter_account"]].values.ravel())
+        accounts = accounts[pd.notna(accounts)]  # drop None (pool trades have no counterparty wallet)
         account_metadata = load_account_metadata(list(accounts))
+        since = as_of.to_pydatetime() - timedelta(days=settings.trade_history_lookback_days)
         all_order_book_events = load_order_book_events_for_pair(
             base_asset,
             counter_asset,
-            since=as_of.to_pydatetime() - timedelta(days=settings.trade_history_lookback_days),
+            since=since,
         )
         order_book_events = pd.DataFrame([e.model_dump() for e in all_order_book_events])
+
+        if "trade_type" in trades.columns:
+            pool_trades = trades.loc[trades["trade_type"] == TradeType.LIQUIDITY_POOL]
+            save_liquidity_pool_trades(pool_trades)
+
+        path_payments = load_path_payments_for_accounts(list(accounts), since)
+        save_path_payments(path_payments)
+        circular_routes = detect_atomic_circular_routes(path_payments)
+        save_circular_routes(circular_routes)
 
         for account in accounts:
             features = build_feature_vector(
@@ -125,7 +147,7 @@ def run(
                 trades_by_pair=trades_by_pair if multi_pair else None,
                 correlated_pairs=correlated_pairs if multi_pair else None,
                 cross_pair_wallets=cross_pair_wallets_map if multi_pair else None,
-                ring_membership=ring_membership,
+                path_payments=path_payments,
             )
             probability, confidence = score_feature_vector(models, features)
 
@@ -153,6 +175,30 @@ def run(
 
     save_scores(scores)
     save_rings(all_rings)
+
+    # Persist feature vectors and compute+cache SHAP values using XGBoost model.
+    if scored_features:
+        feature_vec_rows = [
+            {"wallet": w, "asset_pair": p, "features": f}
+            for w, p, f in zip(scored_wallets, scored_pairs, scored_features)
+        ]
+        save_feature_vectors(feature_vec_rows)
+        xgb_model = models.get("xgboost")
+        if xgb_model is not None:
+            from detection.storage import save_shap_values
+
+            for row in feature_vec_rows:
+                try:
+                    explanation = explain_score(xgb_model, row["features"])
+                    top = top_contributing_features(explanation, n=5)
+                    shap_payload = [{"feature": f, "shap_value": v} for f, v in top]
+                    save_shap_values(row["wallet"], row["asset_pair"], shap_payload)
+                except Exception:
+                    logger.exception(
+                        "Failed to compute SHAP for wallet=%s pair=%s",
+                        row["wallet"],
+                        row["asset_pair"],
+                    )
 
     _enqueue_webhook_alerts(scores)
 
@@ -240,11 +286,8 @@ async def async_run(
                 continue
 
             as_of = pd.Timestamp(trades["ledger_close_time"].max())
-            graph = build_transaction_graph(trades)
-            rings = find_wash_rings(graph)
-            all_rings.extend(rings)
-            ring_membership = build_ring_membership_index(rings, trades=trades)
-            accounts = list(pd.unique(trades[["base_account", "counter_account"]].values.ravel()))
+            accounts = pd.unique(trades[["base_account", "counter_account"]].values.ravel())
+            accounts = list(accounts[pd.notna(accounts)])  # drop None (pool trades have no counterparty wallet)
 
             since = as_of.to_pydatetime() - timedelta(days=settings.trade_history_lookback_days)
             account_metadata, all_order_book_events = await asyncio.gather(
@@ -254,6 +297,18 @@ async def async_run(
 
             order_book_events = pd.DataFrame([e.model_dump() for e in all_order_book_events])
 
+            if "trade_type" in trades.columns:
+                pool_trades = trades.loc[trades["trade_type"] == TradeType.LIQUIDITY_POOL]
+                save_liquidity_pool_trades(pool_trades)
+
+            path_payments_per_account = await asyncio.gather(
+                *(async_load_path_payments(account, since, client) for account in accounts)
+            )
+            path_payments = [p for payments in path_payments_per_account for p in payments]
+            save_path_payments(path_payments)
+            circular_routes = detect_atomic_circular_routes(path_payments)
+            save_circular_routes(circular_routes)
+
             feature_vectors = [
                 build_feature_vector(
                     trades,
@@ -261,7 +316,7 @@ async def async_run(
                     as_of,
                     order_book_events=order_book_events,
                     account_metadata=account_metadata,
-                    ring_membership=ring_membership,
+                    path_payments=path_payments,
                 )
                 for account in accounts
             ]
