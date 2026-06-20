@@ -278,6 +278,17 @@ def drift_reports(limit: int = Query(default=50, ge=1, le=1000)) -> list[dict]:
     return get_drift_reports(limit=limit)
 
 
+@app.get("/admin/robustness-report", dependencies=[Depends(require_admin_key)])
+def robustness_report() -> dict:
+    """Return the latest RobustnessReport from the database (admin only)."""
+    from detection.storage import get_latest_robustness_report
+
+    report = get_latest_robustness_report()
+    if report is None:
+        raise HTTPException(status_code=404, detail="No robustness report found")
+    return report
+
+
 @app.get("/admin/retrain-runs", dependencies=[Depends(require_admin_key)])
 def retrain_runs(
     limit: int = Query(default=50, ge=1, le=1000),

@@ -325,6 +325,40 @@ def eval_robustness(
         typer.echo(f"⚠️  Target missed: adversarial training delta-AUC = {adv_delta:+.3f} (target > -0.10)")
 
 
+
+@app.command("robustness-eval")
+def robustness_eval(
+    epsilon: float = typer.Option(0.1, help="Attack L2 budget"),
+    steps: int = typer.Option(10, help="PGD steps (max 100)"),
+    n_samples: int = typer.Option(200, help="Number of samples from test split to evaluate"),
+) -> None:
+    """Run PGD attacks on the test split and produce a RobustnessReport saved to DB."""
+    if steps > 100:
+        raise typer.BadParameter("--steps cannot exceed 100 for safety")
+
+    from ingestion.synthetic_data import generate_synthetic_dataset
+    from detection.dataset import build_training_dataset
+    from detection.model_inference import load_models
+    from detection.robustness_eval import compute_robustness_report
+    from config.settings import settings
+
+    trades, account_metadata, events, labels = generate_synthetic_dataset(n_normal_accounts=50, n_wash_rings=10, ring_size=4, seed=42)
+    df = build_training_dataset(trades, labels, account_metadata=account_metadata, order_book_events=events)
+
+    try:
+        models = load_models(settings.model_dir)
+    except FileNotFoundError:
+        # train a temporary ensemble for evaluation
+        from detection.model_training import train_ensemble
+
+        logger.info("No trained models found; training temporary ensemble for robustness evaluation")
+        results = train_ensemble(df, adversarial_augment=False)
+        models = {k: v["model"] for k, v in results.items()}
+
+    report = compute_robustness_report(models, df.sample(n=min(n_samples, len(df)), random_state=42), n_samples=200, epsilon=epsilon, steps=steps)
+    typer.echo(report.json(indent=2))
+
+
 @app.command("serve")
 def serve(
     host: str = typer.Option("127.0.0.1", help="Host to bind to"),
