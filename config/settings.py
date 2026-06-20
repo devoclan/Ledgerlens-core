@@ -2,6 +2,7 @@
 
 import os
 from dataclasses import dataclass, field
+import time
 
 from dotenv import load_dotenv
 
@@ -18,7 +19,9 @@ class Settings:
     trade_history_lookback_days: int = field(default_factory=lambda: int(os.getenv("TRADE_HISTORY_LOOKBACK_DAYS", "30")))
 
     benford_mad_threshold: float = field(default_factory=lambda: float(os.getenv("BENFORD_MAD_THRESHOLD", "0.015")))
-    risk_score_threshold: int = field(default_factory=lambda: int(os.getenv("RISK_SCORE_THRESHOLD", "70")))
+    _default_risk_score_threshold: int = field(default_factory=lambda: int(os.getenv("RISK_SCORE_THRESHOLD", "70")))
+    COMMITTEE_QUORUM: int = field(default_factory=lambda: int(os.getenv("COMMITTEE_QUORUM", "3")))
+    COMMITTEE_VOTE_DEADLINE_DAYS: int = field(default_factory=lambda: int(os.getenv("COMMITTEE_VOTE_DEADLINE_DAYS", "14")))
     ensemble_weight_rf: float = field(default_factory=lambda: float(os.getenv("ENSEMBLE_WEIGHT_RF", "0.25")))
     ensemble_weight_xgb: float = field(default_factory=lambda: float(os.getenv("ENSEMBLE_WEIGHT_XGB", "0.50")))
     ensemble_weight_lgbm: float = field(default_factory=lambda: float(os.getenv("ENSEMBLE_WEIGHT_LGBM", "0.25")))
@@ -44,6 +47,9 @@ class Settings:
     )
     admin_api_key: str = field(default_factory=lambda: os.getenv("LEDGERLENS_ADMIN_API_KEY", ""))
 
+    # runtime config cache (module-level TTL implemented below)
+    _runtime_cache_ttl_seconds: int = field(default_factory=lambda: int(os.getenv("RUNTIME_CONFIG_TTL_SECONDS", "60")))
+
     def __post_init__(self) -> None:
         weights = (
             self.ensemble_weight_rf,
@@ -62,3 +68,54 @@ class Settings:
 
 
 settings = Settings()
+
+
+# Runtime config cache
+_runtime_cache: dict = {"ts": 0, "config": {}}
+
+
+def load_runtime_config() -> dict:
+    """Load runtime overrides from the `runtime_config` table with a TTL cache.
+
+    Returns a dict of key->value strings. Cache TTL is configurable via
+    `RUNTIME_CONFIG_TTL_SECONDS` environment variable (default 60).
+    """
+    now = time.time()
+    ttl = settings._runtime_cache_ttl_seconds
+    if _runtime_cache.get("ts", 0) + ttl > now and _runtime_cache.get("config"):
+        return _runtime_cache["config"]
+
+    import sqlite3
+
+    config: dict = {}
+    try:
+        conn = sqlite3.connect(settings.db_path)
+        cur = conn.execute("SELECT key, value FROM runtime_config")
+        for k, v in cur.fetchall():
+            config[k] = v
+        conn.close()
+    except Exception:
+        config = {}
+
+    _runtime_cache["ts"] = now
+    _runtime_cache["config"] = config
+    return config
+
+
+def get_runtime_risk_score_threshold() -> int:
+    cfg = load_runtime_config()
+    if "risk_score_threshold" in cfg:
+        try:
+            return int(cfg["risk_score_threshold"])
+        except Exception:
+            return settings._default_risk_score_threshold
+    return settings._default_risk_score_threshold
+
+
+# Expose risk_score_threshold property for compatibility
+@property
+def runtime_risk_score_threshold(self) -> int:  # type: ignore
+    return get_runtime_risk_score_threshold()
+
+# Monkeypatch onto settings instance for attribute access
+setattr(Settings, "risk_score_threshold", runtime_risk_score_threshold)

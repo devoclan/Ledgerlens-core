@@ -18,6 +18,7 @@ class RiskScore(BaseModel):
     benford_flag: bool
     ml_flag: bool
     confidence: int = Field(ge=0, le=100)
+    disputed: bool = False
     timestamp: datetime
 
     @classmethod

@@ -39,6 +39,9 @@ from detection.storage import (
     get_retrain_runs,
     get_shap_values,
 )
+from detection.dispute_store import submit_dispute, get_dispute, cast_vote
+import sqlite3
+from detection.governance import create_proposal, list_open_proposals, cast_proposal_vote
 from detection.webhook_queue import get_dead_letters
 from detection.webhook_registry import deactivate_subscriber, list_subscribers, register_subscriber
 
@@ -87,6 +90,17 @@ class WebhookCreate(BaseModel):
     min_score: int = 70
     wallet_filter: str | None = None
     asset_pair_filter: str | None = None
+
+
+class DisputeCreate(BaseModel):
+    wallet: str
+    asset_pair: str
+    evidence_url: str | None = None
+
+
+class VoteBody(BaseModel):
+    voter_key_hash: str
+    vote: str
 
 
 @app.get("/health")
@@ -168,6 +182,14 @@ def list_scores(
         ml_flag=ml_flag,
         sort_by=sort_by,
     )
+    # mark disputed flags
+    with sqlite3.connect(settings.db_path) as conn:
+        for s in scores:
+            r = conn.execute(
+                "SELECT 1 FROM score_disputes WHERE wallet = ? AND asset_pair = ? AND status = 'pending' LIMIT 1",
+                (s.wallet, s.asset_pair),
+            ).fetchone()
+            s.disputed = bool(r)
     return [s for s in scores if s.score >= min_score]
 
 
@@ -204,6 +226,13 @@ def wallet_scores(wallet: str) -> list[RiskScore]:
     scores = get_latest_scores(wallet=wallet)
     if not scores:
         raise HTTPException(status_code=404, detail=f"No scores found for wallet {wallet}")
+    with sqlite3.connect(settings.db_path) as conn:
+        for s in scores:
+            r = conn.execute(
+                "SELECT 1 FROM score_disputes WHERE wallet = ? AND asset_pair = ? AND status = 'pending' LIMIT 1",
+                (s.wallet, s.asset_pair),
+            ).fetchone()
+            s.disputed = bool(r)
     return scores
 
 
@@ -358,3 +387,97 @@ def dead_letters() -> list[dict]:
         }
         for d in get_dead_letters()
     ]
+
+
+# ------------------------------------------------------------------
+# Disputes
+# ------------------------------------------------------------------
+
+
+@app.post("/disputes", status_code=201)
+def create_dispute(body: DisputeCreate):
+    try:
+        dispute = submit_dispute(body.wallet, body.asset_pair, body.evidence_url)
+    except ValueError as exc:
+        # Rate limit or missing submission
+        if "Rate limit" in str(exc):
+            raise HTTPException(status_code=429, detail=str(exc))
+        raise HTTPException(status_code=422, detail=str(exc))
+    return dispute.dict()
+
+
+@app.get("/disputes/{dispute_id}")
+def read_dispute(dispute_id: str):
+    d = get_dispute(dispute_id)
+    if d is None:
+        raise HTTPException(status_code=404, detail="Dispute not found")
+    # hide voter identities: return counts only
+    approves = sum(1 for v in d.committee_votes if v.get("vote") == "approve")
+    rejects = sum(1 for v in d.committee_votes if v.get("vote") == "reject")
+    return {
+        "dispute_id": d.dispute_id,
+        "wallet": d.wallet,
+        "asset_pair": d.asset_pair,
+        "disputed_score": d.disputed_score,
+        "soroban_tx_hash": d.soroban_tx_hash,
+        "evidence_url": d.evidence_url,
+        "submitted_at": d.submitted_at,
+        "status": d.status,
+        "votes": {"approve": approves, "reject": rejects},
+        "resolved_at": d.resolved_at,
+        "resolution": d.resolution,
+    }
+
+
+@app.post("/disputes/{dispute_id}/vote", dependencies=[Depends(require_admin_key)])
+def vote_dispute(dispute_id: str, body: VoteBody):
+    # validate voter_key_hash format
+    if len(body.voter_key_hash) != 64:
+        raise HTTPException(status_code=422, detail="voter_key_hash must be 64 hex chars")
+    if body.vote not in ("approve", "reject"):
+        raise HTTPException(status_code=422, detail="vote must be 'approve' or 'reject'")
+    try:
+        d = cast_vote(dispute_id, body.voter_key_hash, body.vote)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return d.dict()
+
+
+# ------------------------------------------------------------------
+# Governance
+# ------------------------------------------------------------------
+
+
+@app.get("/governance/proposals")
+def get_proposals():
+    return [p.dict() for p in list_open_proposals()]
+
+
+class ProposalCreate(BaseModel):
+    proposal_type: str
+    proposed_value: str
+    proposed_by_key_hash: str
+
+
+@app.post("/governance/proposals", dependencies=[Depends(require_admin_key)])
+def create_proposal_endpoint(body: ProposalCreate):
+    try:
+        p = create_proposal(body.proposal_type, body.proposed_value, body.proposed_by_key_hash)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return p.dict()
+
+
+class ProposalVote(BaseModel):
+    voter_key_hash: str
+    vote: str
+
+
+@app.post("/governance/proposals/{proposal_id}/vote", dependencies=[Depends(require_admin_key)])
+def vote_proposal(proposal_id: str, body: ProposalVote):
+    try:
+        p = cast_proposal_vote(proposal_id, body.voter_key_hash, body.vote)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return p.dict()
+

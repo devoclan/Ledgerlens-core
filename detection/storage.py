@@ -199,6 +199,67 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         CREATE INDEX IF NOT EXISTS idx_robustness_reports_created_at ON robustness_reports (created_at);
         """,
     ),
+    (
+        7,
+        "add dispute, committee, overrides, runtime_config and governance tables",
+        """
+        CREATE TABLE IF NOT EXISTS committee_members (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            public_key_hex TEXT NOT NULL,
+            key_hash TEXT NOT NULL,
+            added_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_committee_key_hash ON committee_members (key_hash);
+
+        CREATE TABLE IF NOT EXISTS score_disputes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dispute_id TEXT NOT NULL,
+            wallet TEXT NOT NULL,
+            asset_pair TEXT NOT NULL,
+            disputed_score INTEGER NOT NULL,
+            soroban_tx_hash TEXT NOT NULL,
+            evidence_url TEXT,
+            submitted_at TEXT NOT NULL,
+            status TEXT NOT NULL,
+            committee_votes_json TEXT NOT NULL,
+            resolved_at TEXT,
+            resolution TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_score_disputes_dispute_id ON score_disputes (dispute_id);
+        CREATE INDEX IF NOT EXISTS idx_score_disputes_wallet ON score_disputes (wallet);
+
+        CREATE TABLE IF NOT EXISTS score_overrides (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet TEXT NOT NULL,
+            asset_pair TEXT NOT NULL,
+            dispute_id TEXT NOT NULL,
+            tx_hash TEXT,
+            status TEXT NOT NULL,
+            recorded_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_score_overrides_dispute_id ON score_overrides (dispute_id);
+
+        CREATE TABLE IF NOT EXISTS runtime_config (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS governance_proposals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            proposal_id TEXT NOT NULL,
+            proposal_type TEXT NOT NULL,
+            proposed_value TEXT NOT NULL,
+            proposed_by_key_hash TEXT NOT NULL,
+            votes_for_json TEXT NOT NULL,
+            votes_against_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_governance_proposals_proposal_id ON governance_proposals (proposal_id);
+        """,
+    ),
 ]
 
 

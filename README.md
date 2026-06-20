@@ -172,6 +172,16 @@ The Soroban contract is the on-chain truth layer for LedgerLens risk scores.
 ### Contract Functions
 
 - `submit_score(wallet: Address, asset_pair: Symbol, score: u32, timestamp: u64)` - Registers a computed risk score on-chain (authorised LedgerLens service account only)
+
+### Dispute & Governance
+
+LedgerLens includes an off-chain dispute and governance mechanism for managing published scores.
+
+- Submit disputes via `POST /disputes` with an HTTPS `evidence_url` if available.
+- Committee members vote to resolve disputes; approved disputes remove the score locally and publish a `score=0` override on-chain.
+- Governance proposals allow runtime configuration changes (e.g. `risk_score_threshold`) and committee membership changes.
+
+See `docs/governance_protocol.md` for full details.
 - `get_score(wallet: Address, asset_pair: Symbol) -> RiskScore` - Read-only; returns the most recent risk score and timestamp for a wallet/asset pair, callable by any other Soroban contract
 
 ```rust
