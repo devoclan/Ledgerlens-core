@@ -6,15 +6,16 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
 import pytest
-import torch
 
-from detection.model_registry import get_current_version, load_latest_model, save_versioned_model
-from detection.risk_score import temporal_risk_adjustment
-from detection.temporal_dataset import (
+torch = pytest.importorskip("torch")
+
+from detection.model_registry import get_current_version, load_latest_model, save_versioned_model  # noqa: E402
+from detection.risk_score import temporal_risk_adjustment  # noqa: E402
+from detection.temporal_dataset import (  # noqa: E402
     cluster_score_correlation,
     generate_synthetic_sequence,
 )
-from detection.temporal_model import (
+from detection.temporal_model import (  # noqa: E402
     TemporalAnomalyLSTM,
     predict_temporal_risk,
     train_temporal_model,

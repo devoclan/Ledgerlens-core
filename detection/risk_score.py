@@ -58,6 +58,10 @@ class RiskScore(BaseModel):
         coverage_guarantee: float | None = None,
         sandwich_signal: float = 0.0,
         sandwich_weight: float = 0.0,
+        pdc_score: float = 0.0,
+        pdc_discount_weight: float = 0.0,
+        benford_copula_pval: float = 1.0,
+        benford_copula_weight: float = 0.0,
     ) -> "RiskScore":
         """Combine Benford metrics and an ML probability into a single score.
 
@@ -74,6 +78,16 @@ class RiskScore(BaseModel):
         score; the Benford/ML blend supplies the remaining `1 - sandwich_weight`.
         With the default `sandwich_weight = 0.0` the score is identical to the
         legacy Benford/ML blend.
+
+        `pdc_score` is the wallet's price-discovery contribution from
+        `detection.causal_engine.estimate_pdc`. A positive PDC discounts the
+        correlational score: `causal_adjustment = max(0.0, pdc_score) * pdc_discount_weight`.
+        With the default `pdc_discount_weight = 0.0` the score is unchanged.
+
+        `benford_copula_pval` is the cross-pair multivariate Benford dependence
+        p-value. A small p-value adds a `benford_copula_weight` fraction of
+        `1 - pval` to the composite score. With the default
+        `benford_copula_weight = 0.0` the score is unchanged.
         """
         benford_flag = benford_mad > benford_mad_threshold
         ml_flag = ml_probability >= 0.5
@@ -86,6 +100,11 @@ class RiskScore(BaseModel):
         sandwich_component = max(0.0, min(1.0, sandwich_signal)) * 100
 
         score = round((1.0 - sandwich_weight) * base_component + sandwich_weight * sandwich_component)
+        copula_weight = max(0.0, min(1.0, benford_copula_weight))
+        copula_component = max(0.0, min(1.0, 1.0 - benford_copula_pval)) * 100
+        score = round((1.0 - copula_weight) * score + copula_weight * copula_component)
+        causal_adjustment = max(0.0, pdc_score) * pdc_discount_weight
+        score = round(max(0.0, score - causal_adjustment))
         score = max(0, min(100, score))
 
         return cls(
