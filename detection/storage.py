@@ -15,6 +15,7 @@ integration point is wired up (see README's "Open Integration Points"),
 """
 
 import json
+import logging
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -25,6 +26,8 @@ import pandas as pd
 from config.settings import settings
 from detection.risk_score import RiskScore
 from ingestion.data_models import BridgeTransfer, PathPayment
+
+logger = logging.getLogger("ledgerlens.storage")
 
 
 class AlertType(str, Enum):

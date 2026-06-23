@@ -144,6 +144,8 @@ class Settings:
         self._validate_evm_pool_addresses()
 
     def _validate_evm_pool_addresses(self) -> None:
+        if not self.evm_pool_addresses:
+            return
         from web3 import Web3
 
         for addr in self.evm_pool_addresses:
