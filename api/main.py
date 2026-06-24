@@ -442,6 +442,35 @@ def pool_risk(pool_id: str) -> dict:
     return {"pool_id": pool_id, **risk}
 
 
+@app.get("/amm-anomalies")
+def list_amm_anomalies(
+    min_score: float = Query(0.5, ge=0.0, le=1.0),
+    limit: int = Query(100, le=500),
+    offset: int = Query(0, ge=0),
+) -> list[dict]:
+    """Return AMM wash-trading anomalies ordered by anomaly_score DESC."""
+    from detection.amm_engine import AMMEngine
+
+    engine = AMMEngine()
+    anomalies = engine.get_anomalies(min_score=min_score)
+    anomalies.sort(key=lambda a: a.anomaly_score, reverse=True)
+    page = anomalies[offset : offset + limit]
+    return [
+        {
+            "wallet": a.wallet,
+            "pool_id": a.pool_id,
+            "session_start": a.session_start.isoformat(),
+            "tenure_seconds": a.tenure_seconds,
+            "volume_to_liquidity_ratio": a.volume_to_liquidity_ratio,
+            "deposit_withdraw_symmetry": a.deposit_withdraw_symmetry,
+            "counterparty_concentration": a.counterparty_concentration,
+            "anomaly_score": a.anomaly_score,
+            "detected_at": a.detected_at.isoformat(),
+        }
+        for a in page
+    ]
+
+
 @app.get("/path-payments/circular")
 def circular_path_payments(
     limit: int = Query(default=100, ge=1, le=1000),
@@ -557,6 +586,97 @@ def model_robustness() -> dict:
     from detection.robustness_eval import live_robustness_metrics
 
     return live_robustness_metrics()
+
+
+@app.get("/admin/feature-importance/{version}", dependencies=[Depends(require_admin_key)])
+def feature_importance(
+    version: str,
+    model_name: str | None = Query(default=None, description="Filter by model name, e.g. xgboost"),
+) -> dict:
+    """Return stored SHAP feature importances for a given model version."""
+    from detection.model_registry import load_training_metadata
+
+    if not settings.admin_api_key:
+        raise HTTPException(status_code=503, detail="Admin key not configured")
+
+    metadata = load_training_metadata(settings.model_dir)
+    if not metadata or metadata.get("version") != version:
+        all_versions = metadata.get("version_history", {})
+        if version in all_versions:
+            shap_data = all_versions[version].get("shap_importances", {})
+        else:
+            raise HTTPException(status_code=404, detail=f"Version {version} not found")
+    else:
+        shap_data = metadata.get("shap_importances", {})
+
+    if model_name:
+        shap_data = {model_name: shap_data.get(model_name, [])}
+
+    return {
+        "version": version,
+        "shap_importances": shap_data,
+        "generated_at": metadata.get("trained_at", ""),
+    }
+
+
+@app.get("/admin/feature-importance/diff", dependencies=[Depends(require_admin_key)])
+def feature_importance_diff(
+    old: str = Query(..., description="Old model version"),
+    new: str = Query(..., description="New model version"),
+) -> dict:
+    """Compare SHAP feature importance rankings between two versions."""
+    from detection.model_registry import compare_importance_stability, load_training_metadata
+
+    metadata = load_training_metadata(settings.model_dir)
+    version_history = metadata.get("version_history", {})
+
+    old_meta = version_history.get(old, {})
+    new_meta = version_history.get(new, metadata if metadata.get("version") == new else {})
+
+    if not old_meta and metadata.get("version") == old:
+        old_meta = metadata
+
+    if not old_meta or not new_meta:
+        raise HTTPException(status_code=404, detail="One or both versions not found")
+
+    stability = compare_importance_stability(old_meta, new_meta)
+    return {
+        "version_old": stability.version_old,
+        "version_new": stability.version_new,
+        "spearman_rho": stability.spearman_rho,
+        "stable": stability.stable,
+        "changed_features": stability.changed_features,
+        "computed_at": stability.computed_at.isoformat(),
+    }
+
+
+@app.get("/admin/psi-history", dependencies=[Depends(require_admin_key)])
+def psi_history(
+    feature: str | None = Query(default=None, description="Filter by feature name"),
+    days: int = Query(default=90, ge=1, le=365),
+) -> list[dict]:
+    """Return per-feature PSI time series data."""
+    from detection.drift_monitor import load_psi_history
+
+    df = load_psi_history(days_back=days, feature_name=feature)
+    if df.empty:
+        return []
+    return df[["feature_name", "psi_value", "computed_at", "window_days"]].to_dict(orient="records")
+
+
+@app.get("/admin/psi-heatmap", dependencies=[Depends(require_admin_key)])
+def psi_heatmap(
+    days: int = Query(default=90, ge=1, le=365),
+) -> FileResponse:
+    """Return the PSI heatmap as a PNG image."""
+    import tempfile
+    from pathlib import Path
+
+    from detection.drift_monitor import export_psi_heatmap
+
+    output_path = Path(tempfile.mktemp(suffix=".png", prefix="psi_heatmap_"))
+    export_psi_heatmap(output_path, days_back=days)
+    return FileResponse(str(output_path), media_type="image/png", filename="psi_heatmap.png")
 
 
 @app.get("/admin/retrain-runs", dependencies=[Depends(require_admin_key)])

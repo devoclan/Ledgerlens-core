@@ -94,6 +94,13 @@ def retrain_check(
     psi_threshold: float = typer.Option(0.20, help="PSI threshold for drift detection"),
     min_drifted_features: int = typer.Option(3, help="Minimum number of drifted features to trigger retraining"),
     force_retrain: bool = typer.Option(False, help="Force retraining even if no drift detected"),
+    force_promote: bool = typer.Option(
+        False,
+        "--force-promote",
+        help="Override SHAP stability check and promote models even when feature importance "
+        "rank correlation drops below the threshold (Spearman rho < 0.70). "
+        "Logged at WARN level for audit trail.",
+    ),
 ) -> None:
     """Check for distribution drift and retrain the ensemble if detected.
 
@@ -102,6 +109,11 @@ def retrain_check(
     (>= min_drifted_features with PSI > psi_threshold), triggers a
     full retraining cycle. New model is promoted only if it matches or
     outperforms the previous model on AUC-ROC.
+
+    After training, computes per-model SHAP feature importances and checks
+    rank-order stability against the previous version. If Spearman rho falls
+    below SHAP_STABILITY_THRESHOLD (default 0.70) for any model, promotion
+    is blocked unless --force-promote is passed.
     """
     import json
     import os
@@ -111,8 +123,12 @@ def retrain_check(
     from detection.dataset import build_training_dataset
     from detection.drift_monitor import is_drift_detected, run_drift_report
     from detection.model_registry import (
+        SHAP_STABILITY_THRESHOLD,
+        compare_importance_stability,
         get_current_version,
+        load_training_metadata,
         rollback_model,
+        save_training_metadata,
     )
     from detection.model_training import save_models, train_ensemble
     from detection.storage import save_drift_report, save_retrain_run
@@ -195,12 +211,57 @@ def retrain_check(
                 new_auc,
             )
 
+    # Compute SHAP importances for the new models
+    from detection.model_registry import compute_shap_summary
+    from detection.feature_engineering import FEATURE_NAMES as _feat_names
+
+    new_shap_importances = {}
+    X_train = df[[c for c in df.columns if c in _feat_names]].values
+    feature_cols = [c for c in df.columns if c in _feat_names]
+    for model_name in model_names:
+        model_obj = new_results[model_name].get("model")
+        if model_obj is not None:
+            try:
+                new_shap_importances[model_name] = compute_shap_summary(
+                    model_obj, X_train, feature_cols
+                )
+            except Exception as e:
+                logger.warning("Failed to compute SHAP summary for %s: %s", model_name, e)
+
+    new_metadata_shap = {
+        "version": metadata.get("version", "unknown"),
+        "shap_importances": new_shap_importances,
+    }
+
+    # SHAP stability check
+    stability = compare_importance_stability(metadata, new_metadata_shap)
+    if not stability.stable:
+        logger.warning(
+            "Feature importance stability check FAILED: min Spearman rho = %.3f "
+            "(threshold: %.3f). Models NOT auto-promoted. "
+            "Rerun with --force-promote to override.",
+            min(stability.spearman_rho.values()) if stability.spearman_rho else 0.0,
+            SHAP_STABILITY_THRESHOLD,
+        )
+        if not force_promote:
+            promoted = False
+        else:
+            logger.warning(
+                "--force-promote used: overriding SHAP stability check (caller: CLI)"
+            )
+
     # Save models and metadata
     training_dataset_path = os.path.join(settings.model_dir, "training_reference.csv")
     df.to_csv(training_dataset_path, index=False)
 
     if promoted:
         save_models(new_results, training_dataset_path=training_dataset_path)
+
+        # Persist SHAP importances in training_metadata.json
+        updated_metadata = load_training_metadata(settings.model_dir)
+        updated_metadata["shap_importances"] = new_shap_importances
+        save_training_metadata(settings.model_dir, updated_metadata)
+
         logger.info("Promoted new models to production")
     else:
         logger.info("New models not promoted; keeping previous versions")
