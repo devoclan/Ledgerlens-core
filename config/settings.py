@@ -63,6 +63,11 @@ class Settings:
         default_factory=lambda: float(os.getenv("SHAP_STABILITY_THRESHOLD", "0.70"))
     )
 
+    # Hours to suppress repeated feature-drift alerts after the first one fires.
+    psi_alert_cooldown_hours: int = field(
+        default_factory=lambda: int(os.getenv("PSI_ALERT_COOLDOWN_HOURS", "24"))
+    )
+
     # Feature Store (Redis hot layer + SQLite cold layer)
     redis_url: str = field(default_factory=lambda: os.getenv("REDIS_URL", "redis://localhost:6379/0"))
     feature_store_ttl_hours: int = field(default_factory=lambda: int(os.getenv("FEATURE_STORE_TTL_HOURS", "48")))
