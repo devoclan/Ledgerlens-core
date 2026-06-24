@@ -412,6 +412,27 @@ def db_migrate(
         typer.echo(f"Database already at latest schema version {after}. No migrations applied.")
 
 
+@app.command("governance-close-expired")
+def governance_close_expired() -> None:
+    """Close all active governance proposals whose voting period has expired.
+
+    Tallies each expired proposal and sets its status to 'passed' or 'rejected'
+    based on the quorum rule (>50% of committee votes 'for'). Designed to be
+    called on a schedule (e.g., cron or systemd timer).
+    """
+    from detection.storage import init_db
+    from detection.governance import GovernanceEngine
+
+    init_db()
+    engine = GovernanceEngine()
+    closed = engine.close_expired()
+    if not closed:
+        typer.echo("No expired proposals to close.")
+    else:
+        for p in closed:
+            typer.echo(f"Proposal {p.id} ({p.proposal_type}): {p.status}")
+
+
 @app.command("reweight")
 def reweight(
     days_back: int = typer.Option(7, "--days-back", help="Feedback window in days"),

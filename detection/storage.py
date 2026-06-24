@@ -372,6 +372,44 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
             ON path_payment_cycles (detected_at);
         """,
     ),
+    (
+        13,
+        "add governance_proposals, governance_votes, governance_committee tables (Issue #150)",
+        """
+        CREATE TABLE IF NOT EXISTS governance_proposals (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            proposal_type   TEXT NOT NULL,
+            payload         TEXT NOT NULL,
+            proposer        TEXT NOT NULL,
+            status          TEXT NOT NULL DEFAULT 'active',
+            submitted_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            voting_ends_at  TIMESTAMP NOT NULL,
+            executed_at     TIMESTAMP,
+            execution_error TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_gov_proposals_status
+            ON governance_proposals (status);
+        CREATE INDEX IF NOT EXISTS idx_gov_proposals_voting_ends
+            ON governance_proposals (voting_ends_at);
+
+        CREATE TABLE IF NOT EXISTS governance_votes (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            proposal_id INTEGER NOT NULL REFERENCES governance_proposals(id),
+            voter       TEXT NOT NULL,
+            decision    TEXT NOT NULL CHECK(decision IN ('for', 'against', 'abstain')),
+            cast_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(proposal_id, voter)
+        );
+        CREATE INDEX IF NOT EXISTS idx_gov_votes_proposal
+            ON governance_votes (proposal_id);
+
+        CREATE TABLE IF NOT EXISTS governance_committee (
+            member      TEXT PRIMARY KEY,
+            added_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            active      INTEGER NOT NULL DEFAULT 1
+        );
+        """,
+    ),
 ]
 
 

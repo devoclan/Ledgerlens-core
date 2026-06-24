@@ -728,23 +728,253 @@ def vote_dispute(dispute_id: str, body: VoteBody):
 
 
 # ------------------------------------------------------------------
-# Governance
+# ZK Commitment endpoints (#147)
 # ------------------------------------------------------------------
 
 
+class CommitRequest(BaseModel):
+    threshold: int
+
+
+class CommitResponse(BaseModel):
+    wallet: str
+    threshold: int
+    commitment_x: int
+    commitment_y: int
+    proof_threshold: int
+    proof_challenge: int
+    range_commitments: list[list[int]]
+    range_responses: list[dict]
+
+
+class VerifyThresholdRequest(BaseModel):
+    commitment_x: int
+    commitment_y: int
+    threshold: int
+    proof_threshold: int
+    proof_challenge: int
+    range_commitments: list[list[int]]
+    range_responses: list[dict]
+    wallet: str = ""
+
+
+@app.post("/scores/{wallet}/commit", response_model=CommitResponse)
+def commit_score(wallet: str, body: CommitRequest) -> CommitResponse:
+    """Generate a Pedersen commitment + ZK threshold proof for wallet's current score.
+
+    Returns a fresh commitment and proof that score >= threshold without revealing
+    the exact score. Raises 422 if the wallet's score does not meet the threshold.
+    """
+    validate_stellar_address(wallet)
+    scores = get_latest_scores(wallet=wallet)
+    if not scores:
+        raise HTTPException(status_code=404, detail=f"No scores found for wallet {wallet}")
+    score = scores[0].score
+
+    from detection.zk_commitment import commit as zk_commit, prove_below_threshold
+
+    threshold = body.threshold
+    if not (0 <= threshold <= 100):
+        raise HTTPException(status_code=422, detail="threshold must be in [0, 100]")
+    if score < threshold:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Cannot generate proof: score does not meet threshold {threshold}",
+        )
+
+    pc = zk_commit(score)
+    try:
+        proof = prove_below_threshold(score, threshold, pc)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    proof.wallet = wallet
+    return CommitResponse(
+        wallet=wallet,
+        threshold=threshold,
+        commitment_x=proof.commitment[0],
+        commitment_y=proof.commitment[1],
+        proof_threshold=proof.threshold,
+        proof_challenge=proof.challenge,
+        range_commitments=[list(rc) for rc in proof.range_commitments],
+        range_responses=proof.range_responses,
+    )
+
+
+@app.post("/scores/verify-threshold")
+def verify_threshold(body: VerifyThresholdRequest) -> dict:
+    """Verify a ZK threshold proof. Returns {\"valid\": bool}."""
+    from detection.zk_commitment import PedersenCommitment, ThresholdProof, verify_below_threshold
+
+    pc = PedersenCommitment(C=(body.commitment_x, body.commitment_y), r=0)
+    proof = ThresholdProof(
+        commitment=(body.commitment_x, body.commitment_y),
+        threshold=body.proof_threshold,
+        challenge=body.proof_challenge,
+        response=0,
+        range_commitments=[(rc[0], rc[1]) for rc in body.range_commitments],
+        range_responses=body.range_responses,
+        wallet=body.wallet,
+    )
+    valid = verify_below_threshold(pc, body.threshold, proof)
+    return {"valid": valid}
+
+
+# ------------------------------------------------------------------
+# Governance (#150)
+# ------------------------------------------------------------------
+
+
+class ProposalSubmission(BaseModel):
+    proposer: str
+    proposal_type: str   # config_change | committee_update
+    payload: dict        # {"key": ..., "new_value": ...} or {"action": ..., "member": ...}
+
+
+class VoteSubmission(BaseModel):
+    voter: str
+    decision: str  # for | against | abstain
+
+
+def _proposal_out(p) -> dict:
+    return {
+        "id": p.id,
+        "proposal_type": p.proposal_type,
+        "payload": p.payload,
+        "proposer": p.proposer,
+        "status": p.status,
+        "submitted_at": p.submitted_at.isoformat() if p.submitted_at else None,
+        "voting_ends_at": p.voting_ends_at.isoformat() if p.voting_ends_at else None,
+        "executed_at": p.executed_at.isoformat() if p.executed_at else None,
+        "execution_error": p.execution_error,
+    }
+
+
+def _get_governance_engine():
+    from detection.governance import GovernanceEngine
+    return GovernanceEngine()
+
+
+@app.post("/governance/proposals", status_code=201)
+def submit_governance_proposal(body: ProposalSubmission) -> dict:
+    """Submit a new governance proposal. Proposer must be an active committee member."""
+    engine = _get_governance_engine()
+    from detection.governance import GovernanceError
+    try:
+        p = engine.submit_proposal(body.proposer, body.proposal_type, body.payload)
+    except GovernanceError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return _proposal_out(p)
+
+
 @app.get("/governance/proposals")
-def get_proposals():
+def list_governance_proposals(
+    status: str | None = Query(default=None, description="Filter by status (active, passed, rejected, executed, failed)"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+) -> list[dict]:
+    """List governance proposals, optionally filtered by status."""
+    from detection.governance import _connect as gov_connect, _row_to_proposal
+
+    offset = (page - 1) * page_size
+    with gov_connect() as conn:
+        if status:
+            rows = conn.execute(
+                "SELECT * FROM governance_proposals WHERE status = ? ORDER BY submitted_at DESC LIMIT ? OFFSET ?",
+                (status, page_size, offset),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM governance_proposals ORDER BY submitted_at DESC LIMIT ? OFFSET ?",
+                (page_size, offset),
+            ).fetchall()
+    return [_proposal_out(_row_to_proposal(r)) for r in rows]
+
+
+@app.get("/governance/proposals/{proposal_id}")
+def get_governance_proposal(proposal_id: int) -> dict:
+    """Get a single governance proposal with its tally."""
+    from detection.governance import GovernanceEngine, GovernanceError, _connect as gov_connect, _row_to_proposal
+
+    with gov_connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM governance_proposals WHERE id = ?", (proposal_id,)
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Proposal {proposal_id} not found")
+
+    p = _row_to_proposal(row)
+    out = _proposal_out(p)
+
+    engine = GovernanceEngine()
+    try:
+        tally = engine.tally_proposal(proposal_id)
+        out["tally"] = {
+            "for_count": tally.for_count,
+            "against_count": tally.against_count,
+            "abstain_count": tally.abstain_count,
+            "committee_size": tally.committee_size,
+            "quorum_required": tally.quorum_required,
+            "quorum_met": tally.quorum_met,
+            "outcome": tally.outcome,
+        }
+    except Exception:
+        out["tally"] = None
+    return out
+
+
+@app.post("/governance/proposals/{proposal_id}/vote")
+def cast_governance_vote(proposal_id: int, body: VoteSubmission) -> dict:
+    """Cast a vote on a governance proposal."""
+    from detection.governance import GovernanceEngine, GovernanceVoteError
+
+    engine = GovernanceEngine()
+    try:
+        vote = engine.cast_vote(proposal_id, body.voter, body.decision)
+    except GovernanceVoteError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    return {
+        "id": vote.id,
+        "proposal_id": vote.proposal_id,
+        "voter": vote.voter,
+        "decision": vote.decision,
+        "cast_at": vote.cast_at.isoformat(),
+    }
+
+
+@app.post(
+    "/governance/proposals/{proposal_id}/execute",
+    dependencies=[Depends(require_admin_key)],
+)
+def execute_governance_proposal(proposal_id: int) -> dict:
+    """Execute a passed governance proposal (admin-key gated)."""
+    from detection.governance import GovernanceEngine, GovernanceError
+
+    engine = GovernanceEngine()
+    try:
+        p = engine.execute_proposal(proposal_id)
+    except GovernanceError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return _proposal_out(p)
+
+
+# Legacy shim endpoints (kept for backward compatibility)
+
+@app.get("/governance/proposals/legacy/open")
+def legacy_get_proposals():
+    """Legacy: returns open proposals using old proposal schema."""
     return [p.dict() for p in list_open_proposals()]
 
 
-class ProposalCreate(BaseModel):
+class LegacyProposalCreate(BaseModel):
     proposal_type: str
     proposed_value: str
     proposed_by_key_hash: str
 
 
-@app.post("/governance/proposals", dependencies=[Depends(require_admin_key)])
-def create_proposal_endpoint(body: ProposalCreate):
+@app.post("/governance/proposals/legacy", dependencies=[Depends(require_admin_key)])
+def legacy_create_proposal_endpoint(body: LegacyProposalCreate):
     try:
         p = create_proposal(body.proposal_type, body.proposed_value, body.proposed_by_key_hash)
     except ValueError as exc:
@@ -752,13 +982,13 @@ def create_proposal_endpoint(body: ProposalCreate):
     return p.dict()
 
 
-class ProposalVote(BaseModel):
+class LegacyProposalVote(BaseModel):
     voter_key_hash: str
     vote: str
 
 
-@app.post("/governance/proposals/{proposal_id}/vote", dependencies=[Depends(require_admin_key)])
-def vote_proposal(proposal_id: str, body: ProposalVote):
+@app.post("/governance/proposals/legacy/{proposal_id}/vote", dependencies=[Depends(require_admin_key)])
+def legacy_vote_proposal(proposal_id: str, body: LegacyProposalVote):
     try:
         p = cast_proposal_vote(proposal_id, body.voter_key_hash, body.vote)
     except ValueError as exc:
