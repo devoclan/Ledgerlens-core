@@ -559,6 +559,68 @@ def model_robustness() -> dict:
     return live_robustness_metrics()
 
 
+@app.get("/admin/feature-importance/{version}", dependencies=[Depends(require_admin_key)])
+def feature_importance(
+    version: str,
+    model_name: str | None = Query(default=None, description="Filter by model name, e.g. xgboost"),
+) -> dict:
+    """Return stored SHAP feature importances for a given model version."""
+    from detection.model_registry import load_training_metadata
+
+    if not settings.admin_api_key:
+        raise HTTPException(status_code=503, detail="Admin key not configured")
+
+    metadata = load_training_metadata(settings.model_dir)
+    if not metadata or metadata.get("version") != version:
+        all_versions = metadata.get("version_history", {})
+        if version in all_versions:
+            shap_data = all_versions[version].get("shap_importances", {})
+        else:
+            raise HTTPException(status_code=404, detail=f"Version {version} not found")
+    else:
+        shap_data = metadata.get("shap_importances", {})
+
+    if model_name:
+        shap_data = {model_name: shap_data.get(model_name, [])}
+
+    return {
+        "version": version,
+        "shap_importances": shap_data,
+        "generated_at": metadata.get("trained_at", ""),
+    }
+
+
+@app.get("/admin/feature-importance/diff", dependencies=[Depends(require_admin_key)])
+def feature_importance_diff(
+    old: str = Query(..., description="Old model version"),
+    new: str = Query(..., description="New model version"),
+) -> dict:
+    """Compare SHAP feature importance rankings between two versions."""
+    from detection.model_registry import compare_importance_stability, load_training_metadata
+
+    metadata = load_training_metadata(settings.model_dir)
+    version_history = metadata.get("version_history", {})
+
+    old_meta = version_history.get(old, {})
+    new_meta = version_history.get(new, metadata if metadata.get("version") == new else {})
+
+    if not old_meta and metadata.get("version") == old:
+        old_meta = metadata
+
+    if not old_meta or not new_meta:
+        raise HTTPException(status_code=404, detail="One or both versions not found")
+
+    stability = compare_importance_stability(old_meta, new_meta)
+    return {
+        "version_old": stability.version_old,
+        "version_new": stability.version_new,
+        "spearman_rho": stability.spearman_rho,
+        "stable": stability.stable,
+        "changed_features": stability.changed_features,
+        "computed_at": stability.computed_at.isoformat(),
+    }
+
+
 @app.get("/admin/retrain-runs", dependencies=[Depends(require_admin_key)])
 def retrain_runs(
     limit: int = Query(default=50, ge=1, le=1000),

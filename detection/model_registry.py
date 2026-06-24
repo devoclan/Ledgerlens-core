@@ -1,20 +1,154 @@
-"""Manage versioned model storage and safe rollback.
+"""Manage versioned model storage, safe rollback, and SHAP importance tracking.
 
 Models are stored with version hashes based on the training data and timestamp,
 allowing fine-grained tracking of which model version produced which scores.
 A latest pointer tracks the currently-active model for inference.
+
+Per-version SHAP feature importances are stored in training_metadata.json under
+the ``shap_importances`` key. The ``compare_importance_stability`` function
+computes Spearman rank correlation between consecutive model versions' top-10
+feature rankings and gates auto-promotion when correlation drops below the
+configured threshold.
 """
 
 import hashlib
+import json
 import logging
 import os
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Dict, List
+
+import numpy as np
+from scipy.stats import spearmanr
 
 from config.settings import settings
 from detection.model_signing import assert_within_model_dir, safe_joblib_load, sign_model_file
 
 logger = logging.getLogger("ledgerlens.model_registry")
+
+SHAP_STABILITY_THRESHOLD: float = float(os.getenv("SHAP_STABILITY_THRESHOLD", "0.70"))
+
+
+@dataclass
+class StabilityReport:
+    version_old: str
+    version_new: str
+    spearman_rho: Dict[str, float]
+    stable: bool
+    changed_features: Dict[str, List[str]]
+    computed_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+def compute_shap_summary(
+    model, X_train: np.ndarray, feature_names: List[str], n_background: int = 100
+) -> List[Dict]:
+    """Compute mean absolute SHAP values using a background subsample."""
+    import shap
+
+    rng = np.random.RandomState(42)
+    n_samples = min(n_background, X_train.shape[0])
+    idx = rng.choice(X_train.shape[0], size=n_samples, replace=False)
+    background = X_train[idx]
+
+    if hasattr(model, "estimators_"):
+        explainer = shap.TreeExplainer(model, background)
+    else:
+        explainer = shap.TreeExplainer(model)
+
+    shap_values = explainer.shap_values(background)
+    if isinstance(shap_values, list):
+        shap_values = shap_values[1]
+    elif shap_values.ndim == 3:
+        shap_values = shap_values[:, :, 1]
+
+    mean_abs = np.abs(shap_values).mean(axis=0)
+    ranked = sorted(
+        [{"feature": f, "mean_abs_shap": float(v), "rank": 0} for f, v in zip(feature_names, mean_abs)],
+        key=lambda x: -x["mean_abs_shap"],
+    )
+    for i, item in enumerate(ranked):
+        item["rank"] = i + 1
+    return ranked[:10]
+
+
+def compute_spearman_rho(old_top10: List[Dict], new_top10: List[Dict]) -> float:
+    """Compute Spearman rank correlation between old and new feature rankings."""
+    all_features = list({item["feature"] for item in old_top10 + new_top10})
+    old_ranks = {item["feature"]: item["rank"] for item in old_top10}
+    new_ranks = {item["feature"]: item["rank"] for item in new_top10}
+    old_vec = [old_ranks.get(f, 11) for f in all_features]
+    new_vec = [new_ranks.get(f, 11) for f in all_features]
+    if len(all_features) < 2:
+        return 1.0
+    rho, _ = spearmanr(old_vec, new_vec)
+    return float(rho)
+
+
+def compare_importance_stability(
+    old_metadata: dict, new_metadata: dict
+) -> StabilityReport:
+    """Compare SHAP feature importance rankings between two model versions."""
+    old_version = old_metadata.get("version", "unknown")
+    new_version = new_metadata.get("version", "unknown")
+    old_shap = old_metadata.get("shap_importances", {})
+    new_shap = new_metadata.get("shap_importances", {})
+
+    if not old_shap:
+        return StabilityReport(
+            version_old=old_version,
+            version_new=new_version,
+            spearman_rho={},
+            stable=True,
+            changed_features={},
+        )
+
+    rho_dict: Dict[str, float] = {}
+    changed: Dict[str, List[str]] = {}
+    all_models = set(old_shap.keys()) | set(new_shap.keys())
+
+    for model_name in all_models:
+        old_top10 = old_shap.get(model_name, [])
+        new_top10 = new_shap.get(model_name, [])
+        if not old_top10 or not new_top10:
+            rho_dict[model_name] = 1.0
+            changed[model_name] = []
+            continue
+
+        rho_dict[model_name] = compute_spearman_rho(old_top10, new_top10)
+
+        old_features = {item["feature"] for item in old_top10}
+        new_features = {item["feature"] for item in new_top10}
+        entered = new_features - old_features
+        left = old_features - new_features
+        changed[model_name] = sorted(entered | left)
+
+    stable = all(rho >= SHAP_STABILITY_THRESHOLD for rho in rho_dict.values())
+
+    return StabilityReport(
+        version_old=old_version,
+        version_new=new_version,
+        spearman_rho=rho_dict,
+        stable=stable,
+        changed_features=changed,
+    )
+
+
+def load_training_metadata(model_dir: str) -> dict:
+    """Load training_metadata.json from model_dir."""
+    path = os.path.join(model_dir, "training_metadata.json")
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def save_training_metadata(model_dir: str, metadata: dict) -> None:
+    """Write training_metadata.json to model_dir."""
+    path = os.path.join(model_dir, "training_metadata.json")
+    with open(path, "w") as f:
+        json.dump(metadata, f, indent=2, default=str)
 
 
 def _compute_version_hash(training_row_count: int, column_hash: str) -> str:
