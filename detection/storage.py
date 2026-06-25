@@ -372,6 +372,43 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
             ON path_payment_cycles (detected_at);
         """,
     ),
+    (
+        13,
+        "add feedback_labels table for analyst performance monitoring",
+        """
+        CREATE TABLE IF NOT EXISTS feedback_labels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet TEXT NOT NULL,
+            asset_pair TEXT NOT NULL,
+            predicted_score INTEGER NOT NULL,
+            true_label INTEGER NOT NULL CHECK(true_label IN (0, 1)),
+            submitted_by TEXT,
+            evidence_url TEXT,
+            recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            score_version TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_feedback_recorded_at
+            ON feedback_labels(recorded_at);
+        """,
+    ),
+    (
+        14,
+        "add degradation_alerts table for model performance degradation tracking",
+        """
+        CREATE TABLE IF NOT EXISTS degradation_alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alert_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            baseline_f1 REAL,
+            current_f1 REAL,
+            f1_drop REAL,
+            precision_current REAL,
+            recall_current REAL,
+            n_feedback_samples INTEGER,
+            model_version TEXT,
+            retrain_triggered INTEGER DEFAULT 0
+        );
+        """,
+    ),
 ]
 
 

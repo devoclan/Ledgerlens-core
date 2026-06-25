@@ -835,3 +835,97 @@ def compliance_audit_trail(wallet: str) -> list[dict]:
     validate_stellar_address(wallet)
     return get_audit_trail(wallet)
 
+
+# ------------------------------------------------------------------
+# Performance monitoring — analyst feedback & degradation reports (Issue-110)
+# ------------------------------------------------------------------
+
+
+class AnalystFeedbackRequest(BaseModel):
+    wallet: str
+    asset_pair: str
+    true_label: int  # 0 = clean, 1 = wash
+    evidence_url: str | None = None
+
+
+@app.post("/performance/feedback", status_code=201)
+def submit_analyst_feedback(body: AnalystFeedbackRequest) -> dict:
+    """Record an analyst ground-truth label for model performance monitoring.
+
+    Writes to the ``feedback_labels`` table consumed by
+    :class:`~detection.drift_monitor.PerformanceMonitor`. The ``submitted_by``
+    field is always set to ``"local_api"`` and never derived from user input.
+
+    Responses:
+    - **201** — label recorded; returns ``{"feedback_id": N, "recorded_at": "..."}``.
+    - **422** — ``true_label`` is not 0 or 1.
+    - **404** — no risk score found for the wallet / asset pair combination.
+    """
+    from detection.drift_monitor import PerformanceMonitor
+    from detection.storage import _connect, init_db
+
+    if body.true_label not in (0, 1):
+        raise HTTPException(
+            status_code=422,
+            detail=f"true_label must be 0 or 1, got {body.true_label!r}",
+        )
+
+    init_db()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT score FROM risk_scores "
+            "WHERE wallet = ? AND asset_pair = ? "
+            "ORDER BY timestamp DESC LIMIT 1",
+            (body.wallet, body.asset_pair),
+        ).fetchone()
+
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No risk score found for wallet={body.wallet} asset_pair={body.asset_pair}",
+        )
+
+    predicted_score = int(row[0])
+    monitor = PerformanceMonitor(db_path=settings.db_path)
+    try:
+        feedback_id = monitor.record_feedback(
+            wallet=body.wallet,
+            asset_pair=body.asset_pair,
+            predicted_score=predicted_score,
+            true_label=body.true_label,
+            submitted_by="local_api",
+            evidence_url=body.evidence_url,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    return {
+        "feedback_id": feedback_id,
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/admin/performance-report", dependencies=[Depends(require_admin_key)])
+def performance_report() -> dict:
+    """Return the latest :class:`~detection.drift_monitor.PerformanceReport` (admin only).
+
+    Computes precision/recall/F1 on analyst-labelled feedback from the last
+    30 days.  Requires the ``X-LedgerLens-Admin-Key`` header.
+    """
+    from detection.drift_monitor import PerformanceMonitor
+
+    monitor = PerformanceMonitor(db_path=settings.db_path)
+    report = monitor.compute_performance_metrics()
+    return {
+        "precision": report.precision,
+        "recall": report.recall,
+        "f1": report.f1,
+        "n_samples": report.n_samples,
+        "n_positive_labels": report.n_positive_labels,
+        "n_negative_labels": report.n_negative_labels,
+        "window_days": report.window_days,
+        "computed_at": report.computed_at.isoformat(),
+        "degradation_detected": report.degradation_detected,
+        "f1_drop": report.f1_drop,
+    }
+

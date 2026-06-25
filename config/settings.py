@@ -56,6 +56,17 @@ class Settings:
     model_dir: str = field(default_factory=lambda: os.getenv("MODEL_DIR", "./models"))
     db_path: str = field(default_factory=lambda: os.getenv("LEDGERLENS_DB_PATH", "./ledgerlens.db"))
 
+    # Performance monitoring thresholds (Issue-110)
+    performance_degradation_threshold: float = field(
+        default_factory=lambda: float(os.getenv("PERFORMANCE_DEGRADATION_THRESHOLD", "0.05"))
+    )
+    performance_min_feedback_samples: int = field(
+        default_factory=lambda: int(os.getenv("PERFORMANCE_MIN_FEEDBACK_SAMPLES", "20"))
+    )
+    performance_monitoring_window_days: int = field(
+        default_factory=lambda: int(os.getenv("PERFORMANCE_MONITORING_WINDOW_DAYS", "30"))
+    )
+
     # Feature Store (Redis hot layer + SQLite cold layer)
     redis_url: str = field(default_factory=lambda: os.getenv("REDIS_URL", "redis://localhost:6379/0"))
     feature_store_ttl_hours: int = field(default_factory=lambda: int(os.getenv("FEATURE_STORE_TTL_HOURS", "48")))

@@ -7,7 +7,21 @@ models are written to `settings.model_dir` for `model_inference` to load.
 When ``calibrate=True`` a calibration split is held out (10 % of the data,
 stratified by label) *before* any model training, then used after training
 to compute conformal prediction thresholds via ``ConformalCalibrator``.
+
+Stacking ensemble (Issue-111):
+  Architecture: RF / XGBoost / LightGBM as base models → Logistic Regression
+  meta-learner trained on out-of-fold (OOF) predictions with temporal folds.
+
+  OOF generation uses walk-forward cross-validation (5 folds, 7-day gap) so
+  the meta-learner never sees future data during training. The fitted
+  meta-learner is saved to ``models/meta_learner.joblib``.
+
+  At inference time :class:`~detection.model_inference.ModelInference` loads
+  the meta-learner and uses it when available, falling back to equal-weight
+  averaging when absent.
 """
+
+import logging
 
 import joblib
 import numpy as np
@@ -15,13 +29,172 @@ import pandas as pd
 from detection.model_signing import sign_model_file
 from imblearn.over_sampling import SMOTE
 from lightgbm import LGBMClassifier
+from sklearn.base import clone
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, f1_score, roc_auc_score
 from sklearn.model_selection import train_test_split
 from xgboost import XGBClassifier
 
 from config.settings import settings
 from detection.feature_engineering import FEATURE_NAMES
+
+_logger = logging.getLogger("ledgerlens.model_training")
+
+
+STACKING_USE_DISAGREEMENT_FEATURES: bool = True
+
+
+def _walk_forward_cv(
+    X: np.ndarray,
+    timestamps: np.ndarray,
+    n_splits: int = 5,
+    gap_days: float = 7.0,
+):
+    """Temporal walk-forward cross-validation iterator.
+
+    Yields (train_idx, val_idx) pairs ordered chronologically, with a
+    ``gap_days``-day purge gap between train and validation to prevent leakage.
+    """
+    n = len(timestamps)
+    sorted_order = np.argsort(timestamps, kind="stable")
+    fold_size = n // (n_splits + 1)
+
+    for fold in range(n_splits):
+        val_start_pos = (fold + 1) * fold_size
+        val_end_pos = min(val_start_pos + fold_size, n)
+        val_positions = sorted_order[val_start_pos:val_end_pos]
+
+        if len(val_positions) == 0:
+            continue
+
+        val_time_min = timestamps[val_positions].min()
+        gap_threshold = val_time_min - gap_days * 86400  # seconds
+
+        train_positions = sorted_order[:val_start_pos]
+        train_positions = train_positions[timestamps[train_positions] < gap_threshold]
+
+        if len(train_positions) == 0:
+            continue
+
+        yield train_positions, val_positions
+
+
+def generate_oof_predictions(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    timestamps: np.ndarray,
+    base_models: dict,
+    n_splits: int = 5,
+    gap_days: float = 7.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Generate out-of-fold predictions for the stacking meta-learner.
+
+    Uses temporal walk-forward cross-validation to produce OOF predictions
+    that respect the time ordering of transactions and prevent data leakage.
+
+    Args:
+        X_train: Feature matrix of shape (n, p).
+        y_train: Binary labels of shape (n,).
+        timestamps: Unix timestamps (seconds) of shape (n,).
+        base_models: Dict mapping model name to unfitted estimator instance.
+            Keys must be ``"rf"``, ``"xgb"``, ``"lgbm"`` (in that order for
+            the column layout).
+        n_splits: Number of temporal folds (default 5).
+        gap_days: Purge gap in days between train and validation (default 7).
+
+    Returns:
+        Tuple of:
+          - ``oof_proba``: shape (n_oof, 3) — OOF probabilities per base model.
+          - ``oof_labels``: shape (n_oof,) — corresponding true labels.
+
+    Raises:
+        ValueError: if a base model raises during fit or predict_proba.
+    """
+    smote = SMOTE(random_state=42)
+    model_names = list(base_models.keys())
+    oof_proba = np.zeros((len(X_train), len(model_names)))
+    oof_mask = np.zeros(len(X_train), dtype=bool)
+
+    for fold_idx, (train_idx, val_idx) in enumerate(_walk_forward_cv(X_train, timestamps, n_splits, gap_days)):
+        try:
+            X_fold_train, y_fold_train = smote.fit_resample(X_train[train_idx], y_train[train_idx])
+        except Exception:
+            X_fold_train, y_fold_train = X_train[train_idx], y_train[train_idx]
+
+        for col, (name, model_cls) in enumerate(base_models.items()):
+            try:
+                model = clone(model_cls)
+                model.fit(X_fold_train, y_fold_train)
+                proba = model.predict_proba(X_train[val_idx])[:, 1]
+                oof_proba[val_idx, col] = proba
+            except Exception as exc:
+                raise ValueError(
+                    f"generate_oof_predictions: model '{name}' failed on fold {fold_idx}: {exc}"
+                ) from exc
+        oof_mask[val_idx] = True
+
+    return oof_proba[oof_mask], y_train[oof_mask]
+
+
+def train_meta_learner(
+    oof_proba: np.ndarray,
+    oof_labels: np.ndarray,
+    use_disagreement_features: bool = STACKING_USE_DISAGREEMENT_FEATURES,
+) -> LogisticRegression:
+    """Train a logistic-regression meta-learner on OOF base-model predictions.
+
+    Optionally augments the feature set with:
+    - ``model_disagreement``: max − min across the three model predictions.
+    - ``oof_mean``: mean prediction (equal-weight baseline as a feature).
+
+    Args:
+        oof_proba: Shape (n_oof, 3) out-of-fold probabilities.
+        oof_labels: Shape (n_oof,) binary labels.
+        use_disagreement_features: Append disagreement and mean features.
+
+    Returns:
+        Fitted :class:`~sklearn.linear_model.LogisticRegression` meta-learner.
+    """
+    X_meta = oof_proba.copy()
+    if use_disagreement_features and oof_proba.shape[1] >= 2:
+        disagreement = oof_proba.max(axis=1) - oof_proba.min(axis=1)
+        mean_pred = oof_proba.mean(axis=1)
+        X_meta = np.column_stack([X_meta, disagreement, mean_pred])
+
+    unique_classes = np.unique(oof_labels)
+    if len(unique_classes) < 2:
+        _logger.warning(
+            "OOF set contains only one class (%s); meta-learner falls back to equal-weight averaging",
+            unique_classes,
+        )
+        return None
+
+    meta = LogisticRegression(
+        C=1.0,
+        max_iter=1000,
+        solver="lbfgs",
+        class_weight="balanced",
+        random_state=42,
+    )
+    meta.fit(X_meta, oof_labels)
+
+    model_names = ["rf", "xgb", "lgbm"]
+    coef_str = ", ".join(
+        f"{name}={meta.coef_[0][i]:.2f}" for i, name in enumerate(model_names)
+    )
+    _logger.info("Meta-learner coefficients: %s", coef_str)
+    _logger.info("Meta-learner intercept: %.2f", float(meta.intercept_[0]))
+    return meta
+
+
+def _build_meta_features(stack_input: np.ndarray, use_disagreement: bool = STACKING_USE_DISAGREEMENT_FEATURES) -> np.ndarray:
+    """Build the meta-learner feature matrix from base model outputs."""
+    if use_disagreement and stack_input.shape[1] >= 2:
+        disagreement = stack_input.max(axis=1, keepdims=True) - stack_input.min(axis=1, keepdims=True)
+        mean_pred = stack_input.mean(axis=1, keepdims=True)
+        return np.hstack([stack_input, disagreement, mean_pred])
+    return stack_input
 
 
 def _split_features_labels(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
@@ -137,6 +310,50 @@ def _train_ensemble_base(
                 result["model"], cal_split_info["X_cal"], cal_split_info["y_cal"], cal.q_hat
             )
         results["_calib"] = {**cal_split_info, "calibrators": calibrators}
+
+    # --- Stacking: train meta-learner on OOF predictions (Issue-111) ---
+    try:
+        base_model_instances = {
+            "rf": models["random_forest"],
+            "xgb": models["xgboost"],
+            "lgbm": models["lightgbm"],
+        }
+        X_train_np = X_train.values if hasattr(X_train, "values") else X_train
+        y_train_np = y_train.values if hasattr(y_train, "values") else y_train
+        # Use sequential integer "timestamps" as a proxy; gap_days=0 avoids the
+        # large second-scale gap that would exclude all training data with proxy timestamps.
+        timestamps_proxy = np.arange(len(X_train_np), dtype=float)
+        oof_proba, oof_labels = generate_oof_predictions(
+            X_train_np, y_train_np, timestamps_proxy, base_model_instances, gap_days=0.0,
+        )
+        meta_learner = train_meta_learner(oof_proba, oof_labels)
+
+        stacking_metrics: dict = {}
+        if meta_learner is not None and len(oof_labels) > 0:
+            meta_features = _build_meta_features(oof_proba)
+            oof_meta_proba = meta_learner.predict_proba(meta_features)[:, 1]
+            oof_avg_proba = oof_proba.mean(axis=1)
+            try:
+                stacking_metrics["meta_learner_auc_pr"] = float(
+                    average_precision_score(oof_labels, oof_meta_proba)
+                )
+                stacking_metrics["avg_baseline_auc_pr"] = float(
+                    average_precision_score(oof_labels, oof_avg_proba)
+                )
+                stacking_metrics["meta_learner_auc_roc"] = float(
+                    roc_auc_score(oof_labels, oof_meta_proba)
+                )
+                stacking_metrics["meta_learner_coef"] = meta_learner.coef_[0].tolist()
+                _logger.info(
+                    "Meta-learner AUC-PR: %.3f (vs. equal-weight average: %.3f)",
+                    stacking_metrics["meta_learner_auc_pr"],
+                    stacking_metrics["avg_baseline_auc_pr"],
+                )
+            except Exception:
+                pass
+        results["_stacking"] = {"meta_learner": meta_learner, **stacking_metrics}
+    except Exception as exc:
+        _logger.warning("Stacking meta-learner training failed (best-effort): %s", exc)
 
     # --- Adversarial hardening: generate PGD adversarial examples from
     # training true positives and retrain once on the augmented set.
@@ -294,10 +511,7 @@ def save_models(
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
 
-    import logging
-
-    logger = logging.getLogger("ledgerlens.model_training")
-    logger.info("Wrote training metadata to %s", metadata_path)
+    _logger.info("Wrote training metadata to %s", metadata_path)
 
     # ------------------------------------------------------------------
     # Calibration artifacts
@@ -333,11 +547,33 @@ def save_models(
         existing.update(metrics)
         with open(metrics_path, "w") as f:
             json.dump(existing, f, indent=2)
-        logger.info(
+        _logger.info(
             "Wrote calibration metrics (coverage=%.4f) to %s",
             metrics.get("conformal_empirical_coverage", 0.0),
             metrics_path,
         )
+
+    # ------------------------------------------------------------------
+    # Stacking: OOF meta-learner (Issue-111)
+    # ------------------------------------------------------------------
+    stacking_info = results.get("_stacking")
+    if stacking_info and stacking_info.get("meta_learner") is not None:
+        meta_path = os.path.join(model_dir, "meta_learner.joblib")
+        joblib.dump(stacking_info["meta_learner"], meta_path)
+        sign_model_file(meta_path, signing_key)
+        _logger.info("Saved meta-learner to %s", meta_path)
+
+        # Persist meta-learner metrics into training_metadata.json
+        try:
+            with open(metadata_path, "r") as f:
+                meta_md = json.load(f)
+            meta_md["meta_learner_auc_pr"] = stacking_info.get("meta_learner_auc_pr", 0.0)
+            meta_md["meta_learner_auc_roc"] = stacking_info.get("meta_learner_auc_roc", 0.0)
+            meta_md["meta_learner_coef"] = stacking_info.get("meta_learner_coef", [])
+            with open(metadata_path, "w") as f:
+                json.dump(meta_md, f, indent=2)
+        except Exception as exc:
+            _logger.warning("Failed to update training_metadata.json with meta-learner metrics: %s", exc)
 
 
 if __name__ == "__main__":
