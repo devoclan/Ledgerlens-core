@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from api.auth import require_admin_key
 from config.settings import settings, _runtime_cache
 from detection.model_registry import get_current_version, list_model_versions
+from detection.storage import get_krum_aggregation_log
 
 router = APIRouter(prefix="/admin", dependencies=[Depends(require_admin_key)])
 
@@ -178,3 +179,32 @@ def trigger_retrain(background_tasks: BackgroundTasks) -> dict:
     job_id = str(uuid.uuid4())
     background_tasks.add_task(_run_retrain, job_id)
     return {"job_id": job_id, "status": "queued"}
+
+
+# ---------------------------------------------------------------------------
+# FL Krum aggregation log endpoint  (Issue #146)
+# ---------------------------------------------------------------------------
+
+class _AggregationRound(BaseModel):
+    round_number: int
+    n_clients: int
+    f_tolerance: int
+    m_selected: int
+    selected_indices: list[int]
+    excluded_indices: list[int]
+    krum_scores: list[float]
+    recorded_at: str
+
+
+class _AggregationStatus(BaseModel):
+    rounds: list[_AggregationRound]
+
+
+@router.get("/fl/aggregation", response_model=_AggregationStatus, include_in_schema=False)
+def fl_aggregation_status(
+    rounds: int = 10,
+    _: str = Depends(require_admin_key),
+) -> _AggregationStatus:
+    """Return the last N Krum aggregation round decisions (admin-key gated)."""
+    rows = get_krum_aggregation_log(limit=min(rounds, 100), db_path=settings.db_path)
+    return _AggregationStatus(rounds=[_AggregationRound(**r) for r in rows])

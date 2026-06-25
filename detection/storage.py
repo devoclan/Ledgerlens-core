@@ -380,6 +380,24 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         ALTER TABLE bridge_transfers ADD COLUMN verified_at TIMESTAMP;
         """,
     ),
+    (
+        14,
+        "add fl_aggregation_log table for Krum round decisions",
+        """
+        CREATE TABLE IF NOT EXISTS fl_aggregation_log (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            round_number     INTEGER NOT NULL,
+            n_clients        INTEGER NOT NULL,
+            f_tolerance      INTEGER NOT NULL,
+            m_selected       INTEGER NOT NULL,
+            selected_indices TEXT    NOT NULL,
+            excluded_indices TEXT    NOT NULL,
+            krum_scores      TEXT    NOT NULL,
+            recorded_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_fl_agg_log_round ON fl_aggregation_log (round_number);
+        """,
+    ),
 ]
 
 
@@ -1764,6 +1782,72 @@ def get_hop_payment_cycles(
             "cycle_score": r[7],
             "hops": json.loads(r[8]),
             "detected_at": r[9],
+        }
+        for r in rows
+    ]
+
+
+def log_krum_aggregation(
+    round_number: int,
+    n_clients: int,
+    f_tolerance: int,
+    m_selected: int,
+    selected_indices: list,
+    excluded_indices: list,
+    krum_scores: list,
+    db_path: str | None = None,
+) -> None:
+    """Persist one Krum aggregation round decision to fl_aggregation_log."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO fl_aggregation_log
+              (round_number, n_clients, f_tolerance, m_selected,
+               selected_indices, excluded_indices, krum_scores, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                round_number,
+                n_clients,
+                f_tolerance,
+                m_selected,
+                json.dumps(selected_indices),
+                json.dumps(excluded_indices),
+                json.dumps([float(s) for s in krum_scores]),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        conn.commit()
+
+
+def get_krum_aggregation_log(
+    limit: int = 10,
+    db_path: str | None = None,
+) -> list[dict]:
+    """Return the most recent Krum aggregation rounds, newest first."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT round_number, n_clients, f_tolerance, m_selected,
+                   selected_indices, excluded_indices, krum_scores, recorded_at
+            FROM fl_aggregation_log
+            ORDER BY round_number DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [
+        {
+            "round_number": r[0],
+            "n_clients": r[1],
+            "f_tolerance": r[2],
+            "m_selected": r[3],
+            "selected_indices": json.loads(r[4]),
+            "excluded_indices": json.loads(r[5]),
+            "krum_scores": json.loads(r[6]),
+            "recorded_at": r[7],
         }
         for r in rows
     ]
