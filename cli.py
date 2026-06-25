@@ -841,5 +841,231 @@ def config_validate() -> None:
         typer.echo(f"  {name}={value}")
 
 
+score_app = typer.Typer(help="Scoring commands")
+app.add_typer(score_app, name="score")
+
+
+# ---------------------------------------------------------------------------
+# Stellar address validation
+# ---------------------------------------------------------------------------
+
+def _is_valid_stellar_address(addr: str) -> bool:
+    """Return True if addr looks like a Stellar G-address (56 base32 chars)."""
+    if not addr or not addr.startswith("G"):
+        return False
+    if len(addr) != 56:
+        return False
+    _B32_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567")
+    return all(c in _B32_CHARS for c in addr)
+
+
+def _score_one_wallet(
+    wallet: str,
+    models: dict,
+    feature_names: list[str],
+    calibrators: dict,
+) -> dict:
+    """Score a single wallet using loaded models. Returns a result dict."""
+    import json
+    from datetime import datetime, timezone
+
+    from detection.model_inference import score_with_uncertainty
+
+    # Try feature store cache first; fall back to zero vector
+    fv: dict = {name: 0.0 for name in feature_names}
+    try:
+        from detection.feature_store import FeatureStore
+        fs = FeatureStore()
+        cached = fs.get(wallet)
+        if cached:
+            fv.update(cached)
+    except Exception:
+        pass
+
+    uncertainty = score_with_uncertainty(models, fv, calibrators=calibrators or None)
+
+    top_features: list[str] = []
+    try:
+        from detection.shap_explainer import top_contributing_features
+        top_features = top_contributing_features(models, fv, n=5)
+    except Exception:
+        pass
+
+    return {
+        "wallet": wallet,
+        "score": round(uncertainty["score"], 2),
+        "confidence_lower": round(uncertainty.get("score_lower", 0.0), 2),
+        "confidence_upper": round(uncertainty.get("score_upper", 100.0), 2),
+        "top_features": json.dumps(top_features),
+        "scored_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@score_app.command("bulk")
+def score_bulk(
+    input_file: str = typer.Option(..., "--input", "-i", help="CSV file with wallet addresses (one per row)"),
+    output_file: str = typer.Option(..., "--output", "-o", help="CSV file to write scoring results to"),
+    concurrency: int = typer.Option(4, "--concurrency", "-c", min=1, max=16, help="Parallel worker count (1–16)"),
+    min_score: float = typer.Option(None, "--min-score", help="Only include wallets with score >= min_score"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Validate input file without scoring"),
+) -> None:
+    """Score a list of wallets from a CSV file and write results to another CSV.
+
+    Input CSV must have at least one column with the wallet address.  If the
+    column header is ``wallet`` it is used directly; otherwise the first column
+    is assumed to be wallet addresses.  An optional ``label`` column is passed
+    through to the output.
+
+    Examples:
+
+      python cli.py score bulk --input wallets.csv --output results.csv
+
+      python cli.py score bulk --input wallets.csv --output results.csv \\
+        --concurrency 8 --min-score 50
+    """
+    import csv
+    import sys
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from datetime import datetime, timezone
+
+    import pandas as pd
+
+    try:
+        from rich.progress import (
+            BarColumn,
+            MofNCompleteColumn,
+            Progress,
+            SpinnerColumn,
+            TaskProgressColumn,
+            TextColumn,
+            TimeElapsedColumn,
+            TimeRemainingColumn,
+        )
+        _has_rich = True
+    except ImportError:
+        _has_rich = False
+
+    # ── Load input CSV ────────────────────────────────────────────────────────
+    try:
+        df = pd.read_csv(input_file)
+    except Exception as exc:
+        typer.echo(f"ERROR: cannot read {input_file}: {exc}", err=True)
+        raise typer.Exit(1)
+
+    if df.empty:
+        typer.echo("Input file is empty — nothing to score.", err=True)
+        raise typer.Exit(0)
+
+    wallet_col = "wallet" if "wallet" in df.columns else df.columns[0]
+    label_col = "label" if "label" in df.columns else None
+
+    raw_wallets = df[wallet_col].astype(str).tolist()
+
+    # ── Validate addresses ────────────────────────────────────────────────────
+    valid_rows: list[dict] = []
+    skipped = 0
+    for i, row in df.iterrows():
+        addr = str(row[wallet_col]).strip()
+        if not _is_valid_stellar_address(addr):
+            typer.echo(f"WARNING: skipping malformed address on row {i + 2}: {addr!r}", err=True)
+            skipped += 1
+        else:
+            entry = {"wallet": addr}
+            if label_col:
+                entry["label"] = row[label_col]
+            valid_rows.append(entry)
+
+    typer.echo(
+        f"Input: {len(raw_wallets)} rows — {len(valid_rows)} valid, {skipped} skipped",
+        err=True,
+    )
+
+    if dry_run:
+        typer.echo(f"Dry run complete. {len(valid_rows)} addresses would be scored.", err=True)
+        raise typer.Exit(0)
+
+    if not valid_rows:
+        typer.echo("All addresses are malformed — nothing to score.", err=True)
+        raise typer.Exit(1)
+
+    # ── Load models ───────────────────────────────────────────────────────────
+    from config.settings import settings as cfg
+    from detection.model_inference import load_calibration, load_models
+    from detection.feature_engineering import FEATURE_NAMES
+
+    try:
+        models = load_models(cfg.model_dir)
+    except FileNotFoundError:
+        typer.echo(
+            f"ERROR: No trained models found in {cfg.model_dir}. Run `python cli.py train` first.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    calibrators = {}
+    try:
+        calibrators = load_calibration(model_dir=cfg.model_dir) or {}
+    except Exception:
+        pass
+
+    feature_names = list(FEATURE_NAMES)
+
+    # ── Score in parallel with progress bar ───────────────────────────────────
+    results: list[dict] = []
+    wallets = [r["wallet"] for r in valid_rows]
+
+    if _has_rich:
+        progress_ctx = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TaskProgressColumn(),
+            TextColumn("·"),
+            TimeElapsedColumn(),
+            TextColumn("ETA"),
+            TimeRemainingColumn(),
+            refresh_per_second=4,
+        )
+    else:
+        import contextlib
+        progress_ctx = contextlib.nullcontext()
+
+    with progress_ctx as progress:
+        if _has_rich:
+            task = progress.add_task("Scoring wallets", total=len(wallets))
+
+        with ThreadPoolExecutor(max_workers=min(concurrency, 16)) as pool:
+            future_to_wallet = {
+                pool.submit(_score_one_wallet, w, models, feature_names, calibrators): w
+                for w in wallets
+            }
+            for future in as_completed(future_to_wallet):
+                try:
+                    result = future.result()
+                    if min_score is None or result["score"] >= min_score:
+                        results.append(result)
+                except Exception as exc:
+                    w = future_to_wallet[future]
+                    typer.echo(f"WARNING: scoring failed for {w}: {exc}", err=True)
+                finally:
+                    if _has_rich:
+                        progress.advance(task)
+
+    # ── Write output CSV ──────────────────────────────────────────────────────
+    if not results:
+        typer.echo("No results to write (all wallets filtered or failed).", err=True)
+        raise typer.Exit(0)
+
+    out_df = pd.DataFrame(results, columns=["wallet", "score", "confidence_lower", "confidence_upper", "top_features", "scored_at"])
+    out_df.to_csv(output_file, index=False)
+
+    typer.echo(
+        f"Scored {len(results)} wallets → {output_file} "
+        f"({'filtered by min-score=' + str(min_score) if min_score is not None else 'all included'})",
+        err=True,
+    )
+
+
 if __name__ == "__main__":
     app()
