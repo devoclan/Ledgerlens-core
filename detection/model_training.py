@@ -9,6 +9,8 @@ stratified by label) *before* any model training, then used after training
 to compute conformal prediction thresholds via ``ConformalCalibrator``.
 """
 
+import logging
+
 import joblib
 import numpy as np
 import pandas as pd
@@ -22,6 +24,8 @@ from xgboost import XGBClassifier
 
 from config.settings import settings
 from detection.feature_engineering import FEATURE_NAMES
+
+logger = logging.getLogger("ledgerlens.model_training")
 
 
 def _split_features_labels(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
@@ -57,7 +61,6 @@ def _train_ensemble_base(
     ``ConformalCalibrator`` instances are returned under the ``"calib"`` key
     and used by ``save_models`` to persist the artifacts.
     """
-    df = merge_evasion_samples(df, evasion_samples)
     if adversarial_augment:
         from detection.dataset import build_training_dataset
         from ingestion.adversarial_data import ALL_STRATEGIES, generate_adversarial_dataset
@@ -236,8 +239,6 @@ def _train_ensemble_base(
             "f1": lstm_f1,
         }
     except Exception as e:
-        import logging
-        logger = logging.getLogger("ledgerlens.model_training")
         logger.exception("Failed to train temporal LSTM model: %s", e)
 
     if _causal_selected_features is not None:
@@ -326,9 +327,6 @@ def save_models(
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
 
-    import logging
-
-    logger = logging.getLogger("ledgerlens.model_training")
     logger.info("Wrote training metadata to %s", metadata_path)
 
     # ------------------------------------------------------------------
