@@ -3,21 +3,27 @@
 import glob
 import os
 import sqlite3
+import time
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
+from typing import List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 
 from api.auth import require_admin_key
 from config.settings import settings, _runtime_cache
 from detection.model_registry import get_current_version, list_model_versions
-from detection.suppressions import SuppressionsStore
+from detection.storage import get_krum_aggregation_log
 
 router = APIRouter(prefix="/admin", dependencies=[Depends(require_admin_key)])
 
 _MODEL_NAMES = ["random_forest", "xgboost", "lightgbm"]
+
+# Rate limiter instance for the reset endpoint
+_limiter = Limiter(key_func=get_remote_address)
 
 
 # ---------------------------------------------------------------------------
@@ -99,12 +105,12 @@ def get_config() -> dict:
 # ---------------------------------------------------------------------------
 
 
-class ConfigPatch(BaseModel):
+class RuntimeConfigPatch(BaseModel):
     updates: dict[str, str]
 
 
 @router.patch("/config", include_in_schema=False)
-def patch_config(body: ConfigPatch) -> dict:
+def patch_config(body: RuntimeConfigPatch) -> dict:
     """Persist config key/value updates to SQLite and invalidate the in-process cache."""
     now = datetime.now(timezone.utc).isoformat()
     with sqlite3.connect(settings.db_path) as conn:
@@ -183,41 +189,48 @@ def trigger_retrain(background_tasks: BackgroundTasks) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Suppression rules  (Issue #178)
+# FL Privacy endpoint  (Issue #145)
 # ---------------------------------------------------------------------------
 
-
-class SuppressionCreate(BaseModel):
-    wallet: str
-    reason: str
-    expires_at: Optional[str] = None
+import logging as _logging
+_logger = _logging.getLogger("ledgerlens.admin")
 
 
-@router.post("/suppressions", include_in_schema=False, status_code=201)
-def add_suppression(body: SuppressionCreate) -> dict:
-    """Add an alert suppression rule for a wallet."""
-    from storage.audit_log import log_suppression_rule_added
-
-    store = SuppressionsStore()
-    rule = store.add(wallet=body.wallet, reason=body.reason, expires_at=body.expires_at)
-    log_suppression_rule_added(actor="admin")
-    return rule
-
-
-@router.get("/suppressions", include_in_schema=False)
-def list_suppressions() -> list[dict]:
-    """List all active (non-expired) suppression rules."""
-    return SuppressionsStore().list_active()
+class FLPrivacyStatus(BaseModel):
+    current_epsilon: float
+    target_epsilon: float
+    delta: float
+    noise_multiplier: float
+    clip_norm: float
+    budget_exhausted: bool
+    rounds_completed: int
 
 
-@router.delete("/suppressions/{rule_id}", include_in_schema=False)
-def delete_suppression(rule_id: int) -> dict:
-    """Remove a suppression rule by ID."""
-    from storage.audit_log import log_suppression_rule_removed
+@router.get("/fl/privacy", response_model=FLPrivacyStatus, include_in_schema=False)
+def fl_privacy_status() -> FLPrivacyStatus:
+    """Return current FL differential privacy budget status (admin-key gated)."""
+    db_path = settings.db_path
+    try:
+        from detection.federated.privacy_utils import get_privacy_log
+        rows = get_privacy_log(db_path)
+    except Exception:
+        rows = []
 
-    store = SuppressionsStore()
-    deleted = store.delete(rule_id)
-    if not deleted:
-        raise HTTPException(status_code=404, detail=f"Suppression rule {rule_id} not found")
-    log_suppression_rule_removed(actor="admin")
-    return {"deleted": rule_id}
+    target_epsilon = float(os.environ.get("FL_DP_TARGET_EPSILON", "1.0"))
+    delta = float(os.environ.get("FL_DP_DELTA", "1e-5"))
+    noise_multiplier = float(os.environ.get("FL_DP_NOISE_MULTIPLIER", "0.0")) or float(
+        getattr(settings, "federated_noise_multiplier", 0.0)
+    )
+    clip_norm = float(os.environ.get("FL_DP_CLIP_NORM", "1.0"))
+    current_epsilon = rows[-1]["epsilon"] if rows else 0.0
+    budget_exhausted = current_epsilon >= target_epsilon
+
+    return FLPrivacyStatus(
+        current_epsilon=current_epsilon,
+        target_epsilon=target_epsilon,
+        delta=delta,
+        noise_multiplier=noise_multiplier,
+        clip_norm=clip_norm,
+        budget_exhausted=budget_exhausted,
+        rounds_completed=len(rows),
+    )
