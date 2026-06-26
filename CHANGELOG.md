@@ -12,9 +12,8 @@ commit, generates this file, and publishes a tagged Docker image to GHCR.
 ## Unreleased
 
 ### Added
-- **#141** SHAP waterfall explanation endpoint (`GET /v1/scores/{wallet}/explain`): `ShapExplanation` and `FeatureContribution` dataclasses; `ShapExplainer` class with TTL-based caching; `_build_summary_sentence()` for human-readable top-3 feature summaries. Returns base value, ranked contributions, and grammatically correct summary sentence. Supports `model` query parameter (random_forest, xgboost, lightgbm).
-- **#182** Cross-chain bridge transaction correlation (`detection/cross_chain_correlator.py`): `CrossChainCorrelator` class detecting round-trip bridge patterns (Stellar→EVM→Stellar) within a configurable 24h window. Computes `cross_chain_round_trip_score` feature based on amount similarity, timing proximity, and EVM intermediate hop count. Added to `CROSS_CHAIN_FEATURE_NAMES` and `build_cross_chain_features`.
-- **#141** `docs/shap_explanation.md` documenting the SHAP caching strategy, TTL, invalidation, and endpoint usage.
+- **#144** `tests/test_webhook_security.py`: exhaustive webhook HMAC and security test suite — `TestHMACVerification`, `TestTimestampReplayPrevention` (freezegun), `TestSecretRotation`, `TestDeadLetterBehaviour` (exactly 8 failures, exponential backoff), `TestConcurrency`, `TestSSRFProtection`, and AST static-analysis test for `hmac.compare_digest`.
+- **#144** `docs/webhook_security_model.md`: HMAC signing, replay prevention, secret rotation, dead-letter recovery, and SSRF protection documentation.
 - **#147** Pedersen commitment ZK scheme (`detection/zk_commitment.py`): `PedersenParams`, `PedersenCommitment`, `ThresholdProof` dataclasses; `commit()`, `open()`, `prove_below_threshold()`, `verify_below_threshold()` functions over BN254 for privacy-preserving score attestation.
 - **#147** API endpoints `POST /scores/{wallet}/commit` and `POST /scores/verify-threshold` for ZK threshold proofs.
 - **#150** Full governance proposal engine (`detection/governance.py`): `GovernanceEngine` with `submit_proposal`, `cast_vote`, `tally_proposal`, `close_proposal`, `execute_proposal`, `close_expired`; `SettingsReloader` with compile-time allowlist and atomic `.env` write.

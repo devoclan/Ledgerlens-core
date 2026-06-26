@@ -937,7 +937,7 @@ def create_dispute(body: DisputeCreate):
         if "Rate limit" in str(exc):
             raise HTTPException(status_code=429, detail=str(exc))
         raise HTTPException(status_code=422, detail=str(exc))
-    return dispute.dict()
+    return dispute.model_dump()
 
 
 @v1_router.get("/disputes/{dispute_id}")
@@ -974,7 +974,7 @@ def vote_dispute(dispute_id: str, body: VoteBody):
         d = cast_vote(dispute_id, body.voter_key_hash, body.vote)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
-    return d.dict()
+    return d.model_dump()
 
 
 # ------------------------------------------------------------------
@@ -984,7 +984,7 @@ def vote_dispute(dispute_id: str, body: VoteBody):
 
 @v1_router.get("/governance/proposals")
 def get_proposals():
-    return [p.dict() for p in list_open_proposals()]
+    return [p.model_dump() for p in list_open_proposals()]
 
 
 class LegacyProposalCreate(BaseModel):
@@ -999,7 +999,7 @@ def create_proposal_endpoint(body: ProposalCreate):
         p = create_proposal(body.proposal_type, body.proposed_value, body.proposed_by_key_hash)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
-    return p.dict()
+    return p.model_dump()
 
 
 class LegacyProposalVote(BaseModel):
@@ -1013,7 +1013,7 @@ def vote_proposal(proposal_id: str, body: ProposalVote):
         p = cast_proposal_vote(proposal_id, body.voter_key_hash, body.vote)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
-    return p.dict()
+    return p.model_dump()
 
 
 # ------------------------------------------------------------------
